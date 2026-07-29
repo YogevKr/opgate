@@ -1,5 +1,7 @@
 # opgate
 
+[![test](https://github.com/YogevKr/opgate/actions/workflows/test.yml/badge.svg)](https://github.com/YogevKr/opgate/actions/workflows/test.yml)
+
 Scoped, cached 1Password secrets for shells and AI agents.
 
 `opgate` hands secrets to exactly one command, resolved at runtime from
