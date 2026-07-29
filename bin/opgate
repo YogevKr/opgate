@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Standalone entry point for opgate. The zsh plugin (opgate.zsh) is the real
+# engine; this exists for contexts that never source it — agents shelling out
+# through `bash -lc` or plain `sh`, cron, launchd. In-shell function calls keep
+# the memory cache tier; this path still gets the session-file and persistent
+# tiers, which is what makes it cheap.
+emulate -L zsh
+typeset _here="${0:A:h}"
+typeset _f
+for _f in "${OPGATE_ZSH:-}" "$_here/../share/opgate/opgate.zsh" "$_here/../opgate.zsh"; do
+    if [[ -n "$_f" && -r "$_f" ]]; then
+        OPGATE_NO_FUNCTIONS=1 source "$_f"
+        opgate "$@"
+        exit $?
+    fi
+done
+print -u2 -- "opgate: cannot locate opgate.zsh (set OPGATE_ZSH)"
+exit 1
