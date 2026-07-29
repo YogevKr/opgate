@@ -52,12 +52,17 @@
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.1.0
+typeset -g OPGATE_VERSION=0.1.1
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
     # `setopt no_unset`.
     zmodload zsh/datetime 2>/dev/null
+    # b: loads only the zstat builtin, leaving the external `stat` untouched.
+    # zstat replaces the stat(1) call: BSD and GNU stat disagree on flags
+    # (GNU -f is filesystem mode and still prints before failing, corrupting
+    # a $(A || B) capture).
+    zmodload -F zsh/stat b:zstat 2>/dev/null
     typeset -gA _opg_vals   # "<profile>:<VAR>" -> value
     typeset -gA _opg_names  # "<profile>" -> "VAR1 VAR2 ..."
     typeset -gA _opg_mtime  # "<profile>" -> env-file mtime at load
@@ -188,7 +193,7 @@ _opg_session_read() {
     local profile="$1" env_mtime="$2" file file_mtime
     file="$(_opg_session_file "$profile")" || return 1
     [[ -r "$file" ]] || return 1
-    file_mtime="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null)" || return 1
+    file_mtime="$(zstat +mtime "$file" 2>/dev/null)" || return 1
     if (( EPOCHSECONDS - file_mtime >= _opg_session_ttl )); then
         rm -f "$file"
         return 1
@@ -238,7 +243,7 @@ _opg_persist_write() {
 _opg_load() {
     local profile="$1" env_file="$2"
     local mtime
-    mtime="$(stat -f %m "$env_file" 2>/dev/null || stat -c %Y "$env_file" 2>/dev/null)" || mtime=0
+    mtime="$(zstat +mtime "$env_file" 2>/dev/null)" || mtime=0
     if [[ -n "${_opg_names[$profile]}" && "${_opg_mtime[$profile]}" == "$mtime" ]]; then
         return 0
     fi
@@ -335,7 +340,7 @@ _opg_read() {
     for profile in $ordered $rest; do
         env_file="$(_opg_profile_file "$profile")"
         grep -qE "^${var}=" "$env_file" || continue
-        mtime="$(stat -f %m "$env_file" 2>/dev/null || stat -c %Y "$env_file" 2>/dev/null)" || mtime=0
+        mtime="$(zstat +mtime "$env_file" 2>/dev/null)" || mtime=0
         if [[ -n "${_opg_names[$profile]}" ]] ||
            _opg_session_read "$profile" "$mtime" ||
            _opg_persist_read "$profile" "$mtime"; then
@@ -425,7 +430,7 @@ _opg_ls() {
         env_file="$(_opg_profile_file "$profile")"
         auth="$(_opg_auth "$env_file" 2>/dev/null)" || auth="INVALID"
         nvars="$(sed -nE 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$env_file" | wc -l | tr -d ' ')"
-        mtime="$(stat -f %m "$env_file" 2>/dev/null || stat -c %Y "$env_file" 2>/dev/null)" || mtime=0
+        mtime="$(zstat +mtime "$env_file" 2>/dev/null)" || mtime=0
         if   [[ -n "${_opg_names[$profile]}" ]];         then state="warm (memory)"
         elif _opg_session_read "$profile" "$mtime";       then state="warm (session)"
         elif _opg_persist_read "$profile" "$mtime";       then state="warm (persistent)"
