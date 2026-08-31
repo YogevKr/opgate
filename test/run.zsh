@@ -22,6 +22,10 @@ setopt extended_glob
 print -r -- "argv=$* acct=${OP_ACCOUNT:-} satok=${OP_SERVICE_ACCOUNT_TOKEN:+SET}" >> "$OP_FAKE_LOG"
 case "$1" in
     run)
+        # Outage knobs for the failure-posture tests: OP_FAKE_FAIL simulates a
+        # rate-limited account, OP_FAKE_HANG a resolver that never answers.
+        [[ -n "${OP_FAKE_FAIL:-}" ]] && { print -u2 -- "op: too many requests (fake)"; exit 9 }
+        (( ${OP_FAKE_HANG:-0} )) && sleep "$OP_FAKE_HANG"
         local envfile arg
         for arg in "$@"; do
             [[ "$arg" == --env-file=* ]] && envfile="${arg#--env-file=}"
@@ -201,11 +205,17 @@ before="$(opcalls)"
 t "read from cache" "resolved:BAR" "$(opgate read BAR)"
 t "read is op-free" "$before" "$(opcalls)"
 
-# 7. mtime invalidation: touching the env file forces a re-resolve
+# 7. a touch alone no longer costs a resolve: the mtime check misses, the
+#    content hash revalidates the blob and heals the recorded mtime. An
+#    actual edit still invalidates through the hash.
 sleep 1; touch "$work/profiles/personal.env"
 before="$(opcalls)"
 opgate personal /usr/bin/true
-t "mtime invalidates" "$(( before + 1 ))" "$(opcalls)"
+t "touch revalidates by hash" "$before" "$(opcalls)"
+sleep 1; print -r -- "PLAIN2=hello2" >> "$work/profiles/personal.env"
+before="$(opcalls)"
+opgate personal /usr/bin/true
+t "content change invalidates" "$(( before + 1 ))" "$(opcalls)"
 
 # 8. flush: drops session cache -> next fresh-shell call re-resolves
 opgate flush
@@ -369,6 +379,40 @@ print -rn -- "back" | opgate keychain set local-key >/dev/null
 out="$(opgate ls)"
 [[ "$out" == *"[keychain]"* ]]     && t "ls keychain label" "yes" "yes" || t "ls keychain label" "yes" "no"
 [[ "$out" == *"+ keychain]"* ]]    && t "ls mixed label"    "yes" "yes" || t "ls mixed label"    "yes" "no"
+
+# --- failure posture -------------------------------------------------------
+# Measured against a real outage: a shared service-account bucket ran dry and
+# a launchd job hung in `op run` for hours. When op fails, the persistent blob
+# is served stale with a warning; when op hangs, it is killed after
+# OPGATE_OP_TIMEOUT; OPGATE_STALE_FALLBACK=0 restores fail-hard.
+
+# 26. warm the persistent tier, then break op with the env file changed so
+#     every honest tier misses and only the stale path can answer
+print -r -- "# opgate:account test.1password.com" > "$work/profiles/outage.env"
+print -r -- "OUT1=op://vault/item/f1" >> "$work/profiles/outage.env"
+out="$(OPGATE_CACHE_TTL_DAYS=30 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'")"
+t "outage: warm" "resolved:OUT1" "$out"
+
+sleep 1; print -r -- "OUT2=op://vault/item/f2" >> "$work/profiles/outage.env"
+out="$(OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_FAIL=1 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'" 2>"$work/stale.err")" \
+    && t "outage: stale rc" "zero" "zero" || t "outage: stale rc" "zero" "nonzero"
+t "outage: stale value served" "resolved:OUT1" "$out"
+grep -q "serving stale" "$work/stale.err" \
+    && t "outage: stale warns" "yes" "yes" || t "outage: stale warns" "yes" "no"
+grep -q "missing: OUT2" "$work/stale.err" \
+    && t "outage: missing vars named" "yes" "yes" || t "outage: missing vars named" "yes" "no"
+
+# 27. the knob: fail-hard is still available
+OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_FAIL=1 OPGATE_STALE_FALLBACK=0 \
+    zsh -c "source '$root/opgate.zsh'; opgate outage /usr/bin/true" 2>/dev/null \
+    && t "outage: fallback off fails" "nonzero" "zero" \
+    || t "outage: fallback off fails" "nonzero" "nonzero"
+
+# 28. a hung op is killed, and the stale path still answers afterwards
+out="$(OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_HANG=60 OPGATE_OP_TIMEOUT=2 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'" 2>"$work/hang.err")"
+t "outage: hung op killed, stale served" "resolved:OUT1" "$out"
+grep -q "exceeded 2s" "$work/hang.err" \
+    && t "outage: timeout warns" "yes" "yes" || t "outage: timeout warns" "yes" "no"
 
 print
 print -r -- "passed $pass, failed $fail"

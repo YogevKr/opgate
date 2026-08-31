@@ -60,11 +60,20 @@
 # token-file profiles are for. Knobs: OPGATE_CACHE_TTL_DAYS=<days> enables
 # tier 3, OPGATE_SESSION_CACHE=agents keeps terminals memory-only, and
 # OPGATE_SESSION_CACHE=off / OPGATE_NO_SESSION_CACHE=1 disables tiers 2 and 3.
+#
+# Failure posture, measured against a real outage (a shared service-account
+# bucket ran dry mid-day and a launchd gateway hung in `op run` for hours):
+# blobs carry a content hash, so a touched-but-unchanged env file revalidates
+# instead of spending a resolve; `op run` is killed after OPGATE_OP_TIMEOUT
+# seconds (default 120, 0 = unbounded); and when op fails or times out, the
+# persistent blob is served stale with a stderr warning rather than failing
+# the caller (OPGATE_STALE_FALLBACK=0 restores fail-hard). Stale serves stay
+# in memory only — every new process retries op until it succeeds.
 
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.2.0
+typeset -g OPGATE_VERSION=0.3.0
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -79,6 +88,7 @@ _opg_init() {
     typeset -gA _opg_names   # "<profile>" -> "VAR1 VAR2 ..." (cached tiers only)
     typeset -gA _opg_kcnames # "<profile>" -> keychain-sourced VARs, never cached
     typeset -gA _opg_mtime   # "<profile>" -> env-file mtime at load
+    typeset -gA _opg_hash    # "<profile>" -> env-file content hash at load
     [[ -n "${_opg_dir:-}" ]]         || typeset -g _opg_dir="${OPGATE_DIR:-$HOME/.config/opgate}"
     [[ -n "${_opg_session_dir:-}" ]] || typeset -g _opg_session_dir="${TMPDIR:-/tmp}/opgate-session"
     [[ -n "${_opg_session_ttl:-}" ]] || typeset -g _opg_session_ttl="${OPGATE_SESSION_TTL:-43200}"   # 12h
@@ -321,12 +331,29 @@ _opg_session_file() {
     print -r -- "$_opg_session_dir/${key}.${1}"
 }
 
-# Blob layout: "#mtime <env-file mtime>", "#ts <resolved at>", then
-# "<VAR> <base64 value>" per variable, then "#end". The trailer proves the
-# blob is complete, and base64 keeps it inert data rather than sourceable code.
+# Env-file content hash, for revalidating a blob whose mtime no longer
+# matches. One fork, but only on paths that already fork (a write happens
+# after `op run`; a read computes it only after the fork-free mtime check has
+# missed). Truncated: this distinguishes edits, it doesn't resist an attacker
+# who can already write the 0600 file.
+_opg_env_hash() {
+    local file="$1" out
+    if (( ${+commands[shasum]} )); then out="$(shasum -a 256 "$file" 2>/dev/null)"
+    elif (( ${+commands[sha256sum]} )); then out="$(sha256sum "$file" 2>/dev/null)"
+    else return 1
+    fi
+    [[ -n "$out" ]] || return 1
+    print -r -- "${out[1,32]}"
+}
+
+# Blob layout: "#mtime <env-file mtime>", "#hash <env-file content hash>",
+# "#ts <resolved at>", then "<VAR> <base64 value>" per variable, then "#end".
+# The trailer proves the blob is complete, and base64 keeps it inert data
+# rather than sourceable code.
 _opg_blob_encode() {
     local profile="$1" var
     print -r -- "#mtime ${_opg_mtime[$profile]}"
+    [[ -n "${_opg_hash[$profile]:-}" ]] && print -r -- "#hash ${_opg_hash[$profile]}"
     print -r -- "#ts $EPOCHSECONDS"
     for var in ${=_opg_names[$profile]}; do
         print -r -- "$var $(printf '%s' "${_opg_vals[$profile:$var]}" | base64 | tr -d '\n')"
@@ -335,36 +362,59 @@ _opg_blob_encode() {
 }
 
 # Reads a blob on stdin. max_age 0 means "don't check" (the file tier stamps
-# freshness with the file's own mtime instead).
+# freshness with the file's own mtime instead). A blob is valid when its
+# recorded mtime matches — or, failing that, when the caller supplies the
+# current content hash and it matches the recorded one: a touched or
+# edited-and-reverted env file revalidates instead of forcing `op run`.
+# env_mtime "-" skips both checks; that is the stale-fallback path, which
+# owns its own warning.
 _opg_blob_decode() {
-    local profile="$1" env_mtime="$2" max_age="${3:-0}"
-    local line var enc decoded ended=0 ts=0
-    local -a names
+    local profile="$1" env_mtime="$2" max_age="${3:-0}" env_hash="${4:-}"
+    local line var enc decoded ended=0 ts=0 mtime_ok=0 hash_ok=0 blob_hash=""
+    local -a names vals
+    [[ "$env_mtime" == "-" ]] && mtime_ok=1
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         var="${line%% *}"
         enc="${line#* }"
         case "$var" in
-            '#mtime') [[ "$enc" == "$env_mtime" ]] || return 1; continue ;;
+            '#mtime') if [[ "$enc" == "$env_mtime" ]]; then mtime_ok=1
+                      # Without a hash to fall back on, a wrong mtime already
+                      # decides it — keep the old early exit for that path.
+                      elif [[ -z "$env_hash" && "$env_mtime" != "-" ]]; then return 1
+                      fi; continue ;;
+            '#hash')  blob_hash="$enc"
+                      [[ -n "$env_hash" && "$enc" == "$env_hash" ]] && hash_ok=1
+                      continue ;;
             '#ts')    ts="$enc"; continue ;;
             '#end')   ended=1; continue ;;
         esac
         [[ "$enc" =~ '^[A-Za-z0-9+/=]+$' ]] || return 1
         # trailing-X sentinel: command substitution eats trailing newlines
         decoded="$(print -r -- "$enc" | base64 -d 2>/dev/null; printf X)"
-        _opg_vals[$profile:$var]="${decoded%X}"
         names+=("$var")
+        vals+=("${decoded%X}")
     done
+    (( mtime_ok || hash_ok )) || return 1
     (( ended && ${#names} )) || return 1
     if (( max_age > 0 )); then
         (( ts > 0 && EPOCHSECONDS - ts < max_age )) || return 1
     fi
+    # Commit only after the blob has proven itself, so an invalid one cannot
+    # leave half its values behind.
+    local i
+    for (( i = 1; i <= ${#names}; i++ )); do
+        _opg_vals[$profile:${names[i]}]="${vals[i]}"
+    done
     _opg_names[$profile]="${(j: :)names}"
-    _opg_mtime[$profile]="$env_mtime"
+    [[ "$env_mtime" != "-" ]] && _opg_mtime[$profile]="$env_mtime"
+    [[ -n "$blob_hash" ]] && _opg_hash[$profile]="$blob_hash"
+    typeset -g _opg_blob_ts="$ts"
+    return 0
 }
 
 _opg_session_read() {
-    local profile="$1" env_mtime="$2" file file_mtime
+    local profile="$1" env_mtime="$2" env_hash="${3:-}" file file_mtime
     file="$(_opg_session_file "$profile")" || return 1
     [[ -r "$file" ]] || return 1
     file_mtime="$(zstat +mtime "$file" 2>/dev/null)" || return 1
@@ -372,7 +422,7 @@ _opg_session_read() {
         rm -f "$file"
         return 1
     fi
-    _opg_blob_decode "$profile" "$env_mtime" < "$file"
+    _opg_blob_decode "$profile" "$env_mtime" 0 "$env_hash" < "$file"
 }
 
 _opg_session_write() {
@@ -393,12 +443,37 @@ _opg_session_write() {
 _opg_persist_file() { print -r -- "$_opg_persist_dir/${1}.cache" }
 
 _opg_persist_read() {
-    local profile="$1" env_mtime="$2" file
+    local profile="$1" env_mtime="$2" env_hash="${3:-}" file
     (( _opg_persist_ttl > 0 )) || return 1
     _opg_cache_enabled || return 1
     file="$(_opg_persist_file "$profile")"
     [[ -r "$file" ]] || return 1
-    _opg_blob_decode "$profile" "$env_mtime" "$_opg_persist_ttl" < "$file"
+    _opg_blob_decode "$profile" "$env_mtime" "$_opg_persist_ttl" "$env_hash" < "$file"
+}
+
+# Last resort, only after `op run` itself has failed: serve the persistent
+# blob with the mtime and TTL checks waived. A rate-limited account or a dead
+# network turning into a refused boot is strictly worse than yesterday's
+# values with a warning — the values were good enough to cache, and the
+# authorization model is unchanged (same 0600 file, same user). Variables
+# added to the env file since the blob was written are reported missing, not
+# invented. The stale result stays in memory only; the tiers are not
+# rewritten, so every new process keeps retrying `op` until it succeeds.
+# OPGATE_STALE_FALLBACK=0 restores fail-hard.
+_opg_stale_read() {
+    local profile="$1" file
+    [[ "${OPGATE_STALE_FALLBACK:-1}" != (0|off|no) ]] || return 1
+    _opg_cache_enabled || return 1
+    file="$(_opg_persist_file "$profile")"
+    [[ -r "$file" ]] || return 1
+    _opg_blob_decode "$profile" "-" 0 < "$file" || return 1
+    local age="" missing="" var
+    (( ${_opg_blob_ts:-0} > 0 )) && age=" from $(( (EPOCHSECONDS - _opg_blob_ts) / 3600 ))h ago"
+    for var in ${_opg_p_op}; do
+        [[ " ${_opg_names[$profile]} " == *" $var "* ]] || missing+=" $var"
+    done
+    print -u2 -- "opgate: op run failed; serving stale cache for '$profile'$age${missing:+ (missing:$missing)}"
+    return 0
 }
 
 _opg_persist_write() {
@@ -454,6 +529,22 @@ _opg_load() {
         _opg_session_write "$profile"
         return 0
     fi
+    # The fork-free mtime checks have all missed. Before conceding to `op`,
+    # one fork to hash the content: a `touch`, a re-save, or an edit that was
+    # reverted leaves the bytes identical, and the blob revalidates. A hash
+    # hit rewrites the tiers under the current mtime, so the next call is
+    # back on the fork-free path.
+    local hash
+    if hash="$(_opg_env_hash "$env_file")"; then
+        if _opg_session_read "$profile" "$mtime" "$hash" ||
+           _opg_persist_read "$profile" "$mtime" "$hash"; then
+            _opg_mtime[$profile]="$mtime"
+            _opg_hash[$profile]="$hash"
+            _opg_session_write "$profile"
+            _opg_persist_write "$profile"
+            return 0
+        fi
+    fi
 
     # Nothing here needs op: the remaining values are literals that op would
     # hand back unchanged, so resolve them and leave `op` — which may not even
@@ -464,6 +555,7 @@ _opg_load() {
         done
         _opg_names[$profile]="${(j: :)names}"
         _opg_mtime[$profile]="$mtime"
+        _opg_hash[$profile]="${hash:-}"
         _opg_session_write "$profile"
         _opg_persist_write "$profile"
         return 0
@@ -473,7 +565,7 @@ _opg_load() {
     auth="$(_opg_auth "$env_file")" || return 1
     # Resolve through op run itself so semantics match exactly; --no-masking
     # only affects this internal dump, which is captured, never printed.
-    local dump tokfile
+    local dump tokfile rc=0
     case "$auth" in
         token\ *)
             tokfile="${auth#token }"
@@ -481,15 +573,21 @@ _opg_load() {
                 print -u2 -- "opgate: missing service-account token: $tokfile"
                 return 1
             fi
-            dump="$(OP_SERVICE_ACCOUNT_TOKEN="$(<"$tokfile")" op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || return 1
+            OP_SERVICE_ACCOUNT_TOKEN="$(<"$tokfile")" _opg_op_dump "$env_file" || rc=$?
             ;;
         account\ *)
-            dump="$(OP_ACCOUNT="${auth#account }" op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || return 1
+            OP_ACCOUNT="${auth#account }" _opg_op_dump "$env_file" || rc=$?
             ;;
         *)
-            dump="$(op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || return 1
+            _opg_op_dump "$env_file" || rc=$?
             ;;
     esac
+    if (( rc != 0 )); then
+        # op said no (or never answered). Yesterday's blob beats a dead boot.
+        _opg_stale_read "$profile" && return 0
+        return 1
+    fi
+    dump="$REPLY"; unset REPLY
     local kv var
     for kv in ${(0)dump}; do
         [[ -z "$kv" ]] && continue
@@ -502,8 +600,54 @@ _opg_load() {
     done
     _opg_names[$profile]="${(j: :)names}"
     _opg_mtime[$profile]="$mtime"
+    _opg_hash[$profile]="${hash:-}"
     _opg_session_write "$profile"
     _opg_persist_write "$profile"
+}
+
+# `op run`, bounded. op can sit forever on a wedged cache-daemon socket or an
+# authorization that will never arrive, and a resolver that hangs is worse
+# than one that fails — the failure path above can still serve stale values,
+# a hang serves nothing and takes the caller (a gateway boot, a cron) down
+# with it. The subshell keeps job-control chatter out of interactive shells;
+# the dump lands in a 0600 file under the session dir — the same exposure
+# class as the cache blob it is about to become — and is removed either way.
+# OPGATE_OP_TIMEOUT=<seconds> tunes it; 0 restores the unbounded call.
+_opg_op_dump() {
+    local env_file="$1" tmo="${OPGATE_OP_TIMEOUT:-120}"
+    typeset -g REPLY=""
+    if (( tmo <= 0 )); then
+        REPLY="$(op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)"
+        return $?
+    fi
+    local dir="${_opg_session_dir:-${TMPDIR:-/tmp}/opgate-session}" out rc
+    mkdir -p "$dir" 2>/dev/null
+    chmod 700 "$dir" 2>/dev/null
+    out="$dir/op-dump.$$"
+    (
+        setopt local_options no_monitor no_notify
+        umask 077
+        op run --no-masking --env-file="$env_file" -- /usr/bin/env -0 >| "$out" &
+        pid=$!; waited=0   # `local` is a function-only builtin; this is a subshell
+        while kill -0 $pid 2>/dev/null && (( waited < tmo )); do
+            sleep 1; (( waited += 1 ))
+        done
+        if kill -0 $pid 2>/dev/null; then
+            kill -TERM $pid 2>/dev/null
+            sleep 1
+            kill -KILL $pid 2>/dev/null
+            wait $pid 2>/dev/null
+            exit 124
+        fi
+        wait $pid
+    )
+    rc=$?
+    (( rc == 124 )) && print -u2 -- "opgate: op run exceeded ${tmo}s and was killed"
+    if (( rc == 0 )); then
+        REPLY="$(<"$out")"
+    fi
+    rm -f "$out"
+    return $rc
 }
 
 _opg_run() {
