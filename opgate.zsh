@@ -68,12 +68,12 @@
 # seconds (default 120, 0 = unbounded); and when op fails or times out, the
 # persistent blob is served stale with a stderr warning rather than failing
 # the caller (OPGATE_STALE_FALLBACK=0 restores fail-hard). Stale serves stay
-# in memory only — every new process retries op until it succeeds.
+# in memory only. Failed resolves share a retry delay across processes.
 
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.3.0
+typeset -g OPGATE_VERSION=0.4.1
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -94,6 +94,13 @@ _opg_init() {
     [[ -n "${_opg_session_ttl:-}" ]] || typeset -g _opg_session_ttl="${OPGATE_SESSION_TTL:-43200}"   # 12h
     [[ -n "${_opg_persist_dir:-}" ]] || typeset -g _opg_persist_dir="${OPGATE_CACHE_DIR:-$HOME/.cache/opgate}"
     typeset -g _opg_persist_ttl=$(( ${OPGATE_CACHE_TTL_DAYS:-0} * 86400 ))
+    # A revision change invalidates caches in other, already-running shells.
+    local revision=""
+    [[ -r "$_opg_persist_dir/revision" ]] && read -r revision < "$_opg_persist_dir/revision"
+    if [[ "$revision" != "${_opg_revision:-}" ]]; then
+        _opg_vals=() _opg_names=() _opg_kcnames=() _opg_mtime=() _opg_hash=()
+    fi
+    typeset -g _opg_revision="$revision"
 }
 
 _opg_profile_file() { print -r -- "$_opg_dir/$1.env" }
@@ -146,9 +153,9 @@ _opg_parse() {
     setopt extended_glob
     local env_file="$1" content line var raw val quote
     content="$(<"$env_file")" || return 1
-    typeset -ga _opg_p_names _opg_p_kc _opg_p_op _opg_p_lit
+    typeset -ga _opg_p_names _opg_p_kc _opg_p_op _opg_p_lit _opg_p_refs
     typeset -g  _opg_p_needop
-    _opg_p_names=() _opg_p_kc=() _opg_p_op=() _opg_p_lit=() _opg_p_needop=0
+    _opg_p_names=() _opg_p_kc=() _opg_p_op=() _opg_p_lit=() _opg_p_refs=() _opg_p_needop=0
     for line in ${(f)content}; do
         # A line is a declaration only if it starts at column 1 with a bare name
         # and an =. Comments, blanks and indented lines fall out here, including
@@ -171,6 +178,7 @@ _opg_parse() {
             _opg_p_op+=("$var")
             if [[ "$val" == op://* ]]; then
                 _opg_p_needop=1
+                _opg_p_refs+=("$var" "$val")
             else
                 # Resolve a literal here only when op would hand back exactly
                 # these bytes. Single quotes always stop it substituting; short
@@ -328,7 +336,7 @@ _opg_cache_enabled() {
 _opg_session_file() {
     local key
     key="$(_opg_session_key)" || return 1
-    print -r -- "$_opg_session_dir/${key}.${1}"
+    print -r -- "$_opg_session_dir/${key}.${1}.v4"
 }
 
 # Env-file content hash, for revalidating a blob whose mtime no longer
@@ -355,6 +363,7 @@ _opg_blob_encode() {
     print -r -- "#mtime ${_opg_mtime[$profile]}"
     [[ -n "${_opg_hash[$profile]:-}" ]] && print -r -- "#hash ${_opg_hash[$profile]}"
     print -r -- "#ts $EPOCHSECONDS"
+    print -r -- "#revision ${_opg_revision:-}"
     for var in ${=_opg_names[$profile]}; do
         print -r -- "$var $(printf '%s' "${_opg_vals[$profile:$var]}" | base64 | tr -d '\n')"
     done
@@ -370,7 +379,7 @@ _opg_blob_encode() {
 # owns its own warning.
 _opg_blob_decode() {
     local profile="$1" env_mtime="$2" max_age="${3:-0}" env_hash="${4:-}"
-    local line var enc decoded ended=0 ts=0 mtime_ok=0 hash_ok=0 blob_hash=""
+    local line var enc decoded ended=0 ts=0 mtime_ok=0 hash_ok=0 blob_hash="" revision=""
     local -a names vals
     [[ "$env_mtime" == "-" ]] && mtime_ok=1
     while IFS= read -r line; do
@@ -387,6 +396,7 @@ _opg_blob_decode() {
                       [[ -n "$env_hash" && "$enc" == "$env_hash" ]] && hash_ok=1
                       continue ;;
             '#ts')    ts="$enc"; continue ;;
+            '#revision') revision="$enc"; continue ;;
             '#end')   ended=1; continue ;;
         esac
         [[ "$enc" =~ '^[A-Za-z0-9+/=]+$' ]] || return 1
@@ -395,6 +405,7 @@ _opg_blob_decode() {
         names+=("$var")
         vals+=("${decoded%X}")
     done
+    [[ "$revision" == "${_opg_revision:-}" ]] || return 1
     (( mtime_ok || hash_ok )) || return 1
     (( ended && ${#names} )) || return 1
     if (( max_age > 0 )); then
@@ -416,6 +427,9 @@ _opg_blob_decode() {
 _opg_session_read() {
     local profile="$1" env_mtime="$2" env_hash="${3:-}" file file_mtime
     file="$(_opg_session_file "$profile")" || return 1
+    # Read legacy caches only before the first explicit invalidation. New files
+    # use a separate namespace so old shell snapshots cannot overwrite them.
+    if [[ ! -r "$file" && -z "${_opg_revision:-}" ]]; then file="${file%.v4}"; fi
     [[ -r "$file" ]] || return 1
     file_mtime="$(zstat +mtime "$file" 2>/dev/null)" || return 1
     if (( EPOCHSECONDS - file_mtime >= _opg_session_ttl )); then
@@ -440,13 +454,20 @@ _opg_session_write() {
 
 # Persistent tier, off unless OPGATE_CACHE_TTL_DAYS is set. A plain 0600 file
 # rather than the login keychain, which an SSH session cannot read.
-_opg_persist_file() { print -r -- "$_opg_persist_dir/${1}.cache" }
+_opg_persist_file() { print -r -- "$_opg_persist_dir/${1}.v4.cache" }
+
+_opg_persist_read_file() {
+    REPLY="$(_opg_persist_file "$1")"
+    if [[ ! -r "$REPLY" && -z "${_opg_revision:-}" ]]; then
+        REPLY="$_opg_persist_dir/${1}.cache"
+    fi
+}
 
 _opg_persist_read() {
     local profile="$1" env_mtime="$2" env_hash="${3:-}" file
     (( _opg_persist_ttl > 0 )) || return 1
     _opg_cache_enabled || return 1
-    file="$(_opg_persist_file "$profile")"
+    _opg_persist_read_file "$profile"; file="$REPLY"
     [[ -r "$file" ]] || return 1
     _opg_blob_decode "$profile" "$env_mtime" "$_opg_persist_ttl" "$env_hash" < "$file"
 }
@@ -458,13 +479,13 @@ _opg_persist_read() {
 # authorization model is unchanged (same 0600 file, same user). Variables
 # added to the env file since the blob was written are reported missing, not
 # invented. The stale result stays in memory only; the tiers are not
-# rewritten, so every new process keeps retrying `op` until it succeeds.
+# rewritten. A separate failure marker limits retries across processes.
 # OPGATE_STALE_FALLBACK=0 restores fail-hard.
 _opg_stale_read() {
     local profile="$1" file
     [[ "${OPGATE_STALE_FALLBACK:-1}" != (0|off|no) ]] || return 1
     _opg_cache_enabled || return 1
-    file="$(_opg_persist_file "$profile")"
+    _opg_persist_read_file "$profile"; file="$REPLY"
     [[ -r "$file" ]] || return 1
     _opg_blob_decode "$profile" "-" 0 < "$file" || return 1
     local age="" missing="" var
@@ -485,6 +506,40 @@ _opg_persist_write() {
     chmod 700 "$_opg_persist_dir" 2>/dev/null
     tmp="$file.$$"
     ( umask 077; _opg_blob_encode "$profile" >| "$tmp" ) 2>/dev/null || { rm -f "$tmp"; return 0 }
+    mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+# This file contains only a timestamp and profile hash, never secret values.
+# Share failures even with a cold cache: fresh agent shells otherwise retry
+# every reference on every command during a quota or network outage.
+_opg_retry_file() { print -r -- "$_opg_persist_dir/${1}.v4.retry" }
+
+_opg_retry_wait() {
+    local profile="$1" hash="$2" file ts saved_hash revision
+    local delay="${OPGATE_RETRY_SECONDS:-3600}"
+    [[ "$delay" == <-> ]] && (( delay > 0 )) || return 1
+    _opg_cache_enabled || return 1
+    file="$(_opg_retry_file "$profile")"
+    if [[ ! -r "$file" && -z "${_opg_revision:-}" ]]; then file="$_opg_persist_dir/$profile.retry"; fi
+    [[ -r "$file" ]] || return 1
+    read -r ts saved_hash revision < "$file" || return 1
+    [[ "$revision" == "${_opg_revision:-}" ]] || return 1
+    [[ "$ts" == <-> && "$saved_hash" == "$hash" ]] || return 1
+    local left=$(( ts + delay - EPOCHSECONDS ))
+    (( left > 0 && left <= delay )) || return 1
+    print -u2 -- "opgate: retry delayed for '$profile' (${left}s remaining)"
+    return 0
+}
+
+_opg_retry_record() {
+    local profile="$1" hash="$2" file tmp
+    _opg_cache_enabled || return 0
+    file="$(_opg_retry_file "$profile")"
+    tmp="$file.$$"
+    mkdir -p "$_opg_persist_dir" 2>/dev/null || return 0
+    chmod 700 "$_opg_persist_dir" 2>/dev/null
+    ( umask 077; print -r -- "$EPOCHSECONDS $hash ${_opg_revision:-}" >| "$tmp" ) 2>/dev/null || return 0
     mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp"
     return 0
 }
@@ -561,33 +616,32 @@ _opg_load() {
         return 0
     fi
 
+    if _opg_retry_wait "$profile" "${hash:-}"; then
+        _opg_stale_read "$profile" && return 0
+        return 1
+    fi
+
     local auth
     auth="$(_opg_auth "$env_file")" || return 1
     # Resolve through op run itself so semantics match exactly; --no-masking
     # only affects this internal dump, which is captured, never printed.
-    local dump tokfile rc=0
-    case "$auth" in
-        token\ *)
-            tokfile="${auth#token }"
-            if [[ ! -r "$tokfile" ]]; then
-                print -u2 -- "opgate: missing service-account token: $tokfile"
-                return 1
-            fi
-            OP_SERVICE_ACCOUNT_TOKEN="$(<"$tokfile")" _opg_op_dump "$env_file" || rc=$?
-            ;;
-        account\ *)
-            OP_ACCOUNT="${auth#account }" _opg_op_dump "$env_file" || rc=$?
-            ;;
-        *)
-            _opg_op_dump "$env_file" || rc=$?
-            ;;
-    esac
+    local dump rc=0 _opg_preserve_sessions=0
+    # Legacy manual sign-in requires its session token. Explicit human exec
+    # already removed inherited tokens before reaching this resolver.
+    [[ "$auth" == account\ * ]] && _opg_preserve_sessions=1
+    if [[ "$auth" == default ]]; then
+        _opg_op_dump "$env_file" || rc=$?
+        dump="$REPLY"; unset REPLY
+    else
+        dump="$(_opg_auth_run "$auth" _opg_capture_print op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || rc=$?
+    fi
     if (( rc != 0 )); then
+        _opg_retry_record "$profile" "${hash:-}"
         # op said no (or never answered). Yesterday's blob beats a dead boot.
         _opg_stale_read "$profile" && return 0
         return 1
     fi
-    dump="$REPLY"; unset REPLY
+    rm -f "$(_opg_retry_file "$profile")" "$_opg_persist_dir/$profile.retry" 2>/dev/null
     local kv var
     for kv in ${(0)dump}; do
         [[ -z "$kv" ]] && continue
@@ -614,20 +668,27 @@ _opg_load() {
 # class as the cache blob it is about to become — and is removed either way.
 # OPGATE_OP_TIMEOUT=<seconds> tunes it; 0 restores the unbounded call.
 _opg_op_dump() {
-    local env_file="$1" tmo="${OPGATE_OP_TIMEOUT:-120}"
+    local env_file="$1"
+    _opg_capture op run --no-masking --env-file="$env_file" -- /usr/bin/env -0
+}
+
+_opg_capture() {
+    local tmo="${OPGATE_OP_TIMEOUT:-120}"
     typeset -g REPLY=""
     if (( tmo <= 0 )); then
-        REPLY="$(op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)"
+        REPLY="$("$@")"
         return $?
     fi
     local dir="${_opg_session_dir:-${TMPDIR:-/tmp}/opgate-session}" out rc
     mkdir -p "$dir" 2>/dev/null
     chmod 700 "$dir" 2>/dev/null
-    out="$dir/op-dump.$$"
+    # zsh keeps $$ in sibling subshells. A status probe must not overwrite a
+    # simultaneous resolver capture or remove its output before it is consumed.
+    out="$(umask 077; mktemp "$dir/op-dump.XXXXXXXX")" || return 1
     (
         setopt local_options no_monitor no_notify
         umask 077
-        op run --no-masking --env-file="$env_file" -- /usr/bin/env -0 >| "$out" &
+        "$@" >| "$out" &
         pid=$!; waited=0   # `local` is a function-only builtin; this is a subshell
         while kill -0 $pid 2>/dev/null && (( waited < tmo )); do
             sleep 1; (( waited += 1 ))
@@ -670,7 +731,12 @@ _opg_run() {
     for var in ${=_opg_names[$profile]:-} ${=_opg_kcnames[$profile]:-}; do
         assigns+=("$var=${_opg_vals[$profile:$var]}")
     done
-    ( export "${assigns[@]}"; exec "$@" )
+    (
+        [[ "${_opg_clean_child:-0}" == 1 ]] && _opg_scrub_credentials
+        # Bare export prints the inherited environment when the profile is empty.
+        if (( ${#assigns} )); then export "${assigns[@]}"; fi
+        exec "$@"
+    )
 }
 
 # Cache-only lookup of a single variable: prints the value and never invokes
@@ -730,6 +796,11 @@ _opg_flush() {
     [[ "$1" == (--session|-s) ]] && return 0
     for profile in $(_opg_profiles); do
         rm -f "$(_opg_persist_file "$profile")" 2>/dev/null
+        rm -f "$_opg_persist_dir/$profile.cache" 2>/dev/null
+        rm -f "$_opg_session_dir/"*."$profile"(N) "$_opg_session_dir/"*."$profile.v4"(N) 2>/dev/null
+        rm -f "$_opg_persist_dir/$profile.retry" 2>/dev/null
+        rm -f "$_opg_persist_dir/fnox-$profile.retry" 2>/dev/null
+        rm -f "$(_opg_retry_file "$profile")" "$(_opg_retry_file "fnox-$profile")" 2>/dev/null
     done
     return 0
 }
@@ -801,7 +872,7 @@ _opg_approve() {
 }
 
 _opg_ls() {
-    local profile env_file auth state mtime nvars
+    local profile env_file auth state mtime nvars fnox_state
     local -a have; have=($(_opg_profiles))
     (( ${#have} )) || { print -u2 -- "opgate: no profiles in $_opg_dir (opgate init <name> ...)"; return 1 }
     local nkc nop
@@ -833,8 +904,10 @@ _opg_ls() {
             else state="cold"
             fi
         fi
-        printf '%-14s %-38s %2s vars   %s\n' "$profile" "[${auth}]" "$nvars" "$state"
+        fnox_state="$(_opg_fnox_profile_status "$profile" "$env_file")"
+        printf '%-14s %-38s %2s vars   native: %s; fnox: %s\n' "$profile" "[${auth}]" "$nvars" "$state" "$fnox_state"
     done
+    _opg_fnox_status
 }
 
 # opgate keychain set|rm|ls — the write side of the keychain source. There is
@@ -956,13 +1029,437 @@ _opg_initcmd() {
     print -r -- "created $env_file — add your op:// references, then: opgate $profile <command>"
 }
 
+# Explicit interfaces keep account access separate from cached environment values.
+_opg_select_profile() {
+    local profile="$1"
+    [[ "$profile" =~ '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' ]] || {
+        print -u2 -- "opgate: invalid profile name"; return 2
+    }
+    REPLY="$(_opg_profile_file "$profile")"
+    [[ -r "$REPLY" ]] || { print -u2 -- "opgate: no such profile '$profile'"; return 1 }
+}
+
+# Call only inside a child/subshell. Never modify the caller's authorization.
+_opg_scrub_credentials() {
+    local name
+    for name in ${(k)parameters}; do
+        case "$name" in
+            OP_SESSION|OP_SESSION_*)
+                [[ "${1:-0}" == 1 ]] || unset "$name" ;;
+            OP_ACCOUNT|OP_SERVICE_ACCOUNT_TOKEN|OP_CONNECT_*|FNOX_*) unset "$name" ;;
+        esac
+    done
+    return 0
+}
+
+_opg_auth_run() (
+    local auth="$1" tokfile; shift
+    # Never let an inherited service token select the wrong account.
+    _opg_scrub_credentials "${_opg_preserve_sessions:-0}"
+    case "$auth" in
+        token\ *)
+            tokfile="${auth#token }"
+            [[ -r "$tokfile" && -s "$tokfile" ]] || {
+                print -u2 -- "opgate: service account token is unavailable"; return 1
+            }
+            export OP_SERVICE_ACCOUNT_TOKEN="$(<"$tokfile")"
+            [[ -n "${OP_SERVICE_ACCOUNT_TOKEN//[[:space:]]/}" ]] || {
+                print -u2 -- "opgate: service account token is empty"; return 1
+            }
+            ;;
+        account\ *) export OP_ACCOUNT="${auth#account }" ;;
+        *) print -u2 -- "opgate: this interface requires an explicit account or token-file directive"; return 2 ;;
+    esac
+    "$@"
+)
+
+_opg_invalidate() {
+    # Publish before cache removal. Old in-flight resolves retain the old revision.
+    local tmp
+    mkdir -p "$_opg_persist_dir" || return 1
+    chmod 700 "$_opg_persist_dir" || return 1
+    tmp="$(umask 077; mktemp "$_opg_persist_dir/revision.XXXXXX")" || return 1
+    # RANDOM can repeat in sibling zsh subshells. mktemp supplies a fresh name.
+    ( umask 077; print -r -- "${tmp:t}" >| "$tmp" ) || return 1
+    mv -f "$tmp" "$_opg_persist_dir/revision" || return 1
+    _opg_flush
+    _opg_init
+}
+
+_opg_native() {
+    local profile="$1" env_file auth arg mutation=0 rc=0; shift
+    _opg_select_profile "$profile" || return $?
+    env_file="$REPLY"
+    auth="$(_opg_auth "$env_file")" || return 1
+    (( $# )) || { print -u2 -- "usage: opgate op --profile <name> -- <op arguments>"; return 2 }
+    for arg in "$@"; do
+        case "$arg" in
+            --account|--account=*|--session|--session=*)
+                print -u2 -- "opgate: select the account with --profile"; return 2 ;;
+        esac
+    done
+    case "$1 ${2:-}" in
+        'account list'|'account ls')
+            # Device account inventory is metadata, not access to this profile's vaults.
+            shift 2; _opg_accounts "$@"; return $? ;;
+        'item get'|'item list'|'vault get'|'vault list'|'document get'|'document list'|'read '*|'whoami '*)
+            ;;
+        'item create'|'item edit'|'item delete'|'item archive'|'item move'|'item copy'|'document create'|'document edit'|'document delete')
+            mutation=1 ;;
+        *) print -u2 -- "opgate: supported operations are item/document reads and writes, vault reads, read, whoami, and account list"; return 2 ;;
+    esac
+    (( mutation )) && { _opg_invalidate || return 1 }
+    _opg_auth_run "$auth" command op "$@" || rc=$?
+    # Invalidate on failure too: a timeout can follow a committed remote write.
+    if (( mutation )); then
+        _opg_invalidate || { print -u2 -- "opgate: cache invalidation failed after a vault operation"; return 1 }
+    fi
+    return $rc
+}
+
+_opg_session() {
+    local profile="$1" env_file auth; shift
+    _opg_select_profile "$profile" || return $?
+    env_file="$REPLY"
+    auth="$(_opg_auth "$env_file")" || return 1
+    [[ "$auth" == account\ * ]] || { print -u2 -- "opgate: session requires an account profile"; return 2 }
+    (( $# )) || { print -u2 -- "usage: opgate session --profile personal|work -- <command>"; return 2 }
+    # Native desktop approval authorizes the account. Cached values cannot authorize it.
+    _opg_auth_run "$auth" _opg_session_command "$@"
+}
+
+_opg_session_command() {
+    command op vault list --format=json >/dev/null || return $?
+    "$@"
+}
+
+_opg_toml_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    print -rn -- "\"$value\""
+}
+
+_opg_fnox_validate() {
+    _opg_parse "$1" || return 1
+    (( ${#_opg_p_kc} == 0 )) || { print -u2 -- "opgate: fnox backend does not support keychain references; use native"; return 2 }
+    local value var
+    for var in "${_opg_p_names[@]}"; do
+        case "$var" in OP_*|FNOX_*) print -u2 -- "opgate: reserved variable '$var' in fnox profile"; return 2 ;; esac
+    done
+    for value in "${_opg_p_refs[@]}" "${_opg_p_lit[@]}"; do
+        [[ "$value" != *[\$\\]* ]] || { print -u2 -- "opgate: fnox backend requires values without shell expansion or escapes"; return 2 }
+    done
+    return 0
+}
+
+# Pure path calculation: listing must not generate configs or resolve secrets.
+_opg_fnox_config_path() {
+    local profile="$1" env_file="$2" ttl="${OPGATE_FNOX_TTL:-3600}" hash provider
+    [[ "$ttl" == <-> ]] && (( ttl > 0 && ttl <= 86400 )) || {
+        print -u2 -- "opgate: OPGATE_FNOX_TTL must be 1 through 86400 seconds"; return 2
+    }
+    hash="$(_opg_env_hash "$env_file")" || return 1
+    provider="op_${_opg_revision//[^A-Za-z0-9_]/_}_$(( EPOCHSECONDS / ttl ))"
+    REPLY="$_opg_persist_dir/fnox/config/$profile-$hash-$provider.toml"
+}
+
+_opg_fnox_profile_status() (
+    local profile="$1" env_file="$2" auth
+    (( ${+commands[fnox]} )) || { print 'not installed'; return }
+    auth="$(_opg_auth "$env_file" 2>/dev/null)" || { print 'invalid profile'; return }
+    [[ "$auth" == token\ * ]] && _opg_fnox_validate "$env_file" 2>/dev/null || {
+        print 'unsupported'; return
+    }
+    _opg_fnox_config_path "$profile" "$env_file" 2>/dev/null || { print 'invalid TTL'; return }
+    if [[ -r "$REPLY" ]]; then print 'configured'
+    else
+        local -a configs=("$_opg_persist_dir/fnox/config/$profile-"*.toml(N))
+        if (( ${#configs} )); then print 'stale config'; else print 'unused'; fi
+    fi
+)
+
+_opg_fnox_status() (
+    (( ${+commands[fnox]} )) || { print 'fnox daemon: not installed'; return }
+    _opg_scrub_credentials
+    export FNOX_CONFIG_DIR="$_opg_persist_dir/fnox/config"
+    export FNOX_STATE_DIR="$_opg_persist_dir/fnox/state"
+    export XDG_RUNTIME_DIR="$_opg_persist_dir/fnox/runtime"
+    export FNOX_PROFILE=default
+    local OPGATE_OP_TIMEOUT=2 report entries
+    if ! _opg_capture command fnox --config "$FNOX_CONFIG_DIR/status.toml" --non-interactive --if-missing error daemon status 2>/dev/null; then
+        print 'fnox daemon: unavailable'; return
+    fi
+    report="$REPLY"
+    case "$report" in
+        'fnox daemon not running') print 'fnox daemon: stopped' ;;
+        'fnox daemon running'$'\n'*)
+            entries="${report##*$'\n'cached_entries: }"
+            if [[ "$entries" == <-> ]]; then
+                print -r -- "fnox daemon: running; $entries cached entries (shared; per-profile warmth unknown)"
+            else print 'fnox daemon: running; cache count unknown'; fi ;;
+        *) print 'fnox daemon: unknown status' ;;
+    esac
+)
+
+_opg_fnox_config() {
+    local profile="$1" env_file="$2" i
+    _opg_fnox_validate "$env_file" || return $?
+    _opg_fnox_config_path "$profile" "$env_file" || return $?
+    local file="$REPLY" provider="${${REPLY:t}#${profile}-}"
+    provider="${${provider#*-}%.toml}"
+    local dir="$_opg_persist_dir/fnox" tmp
+    mkdir -p "$dir/config" "$dir/state" "$dir/runtime" || return 1
+    chmod 700 "$dir" "$dir/config" "$dir/state" "$dir/runtime" || return 1
+    # Immutable config names prevent concurrent callers from replacing each other's config.
+    if [[ ! -r "$file" ]]; then
+        tmp="$(umask 077; mktemp "$dir/config/build.XXXXXX")" || return 1
+        (
+            umask 077
+            print -r -- '[daemon]'
+            print -r -- 'enabled = true'
+            print -r -- 'idle_timeout = "1h"'
+            print -r -- "[providers.$provider]"
+            print -r -- 'type = "1password"'
+            print -r -- '[providers.literal]'
+            print -r -- 'type = "plain"'
+            print -r -- '[secrets]'
+            for (( i = 1; i <= ${#_opg_p_refs}; i += 2 )); do
+                print -rn -- "${_opg_p_refs[i]} = { provider = \"$provider\", value = "
+                _opg_toml_string "${_opg_p_refs[i+1]}"
+                print -r -- ' }'
+            done
+            for (( i = 1; i <= ${#_opg_p_lit}; i += 2 )); do
+                print -rn -- "${_opg_p_lit[i]} = { provider = \"literal\", value = "
+                _opg_toml_string "${_opg_p_lit[i+1]}"
+                print -r -- ' }'
+            done
+        ) >| "$tmp" || { rm -f "$tmp"; return 1 }
+        mv -f "$tmp" "$file" || return 1
+    fi
+    REPLY="$file"
+}
+
+_opg_capture_print() {
+    _opg_capture "$@" || return $?
+    print -rn -- "$REPLY"
+}
+
+_opg_account_exec() {
+    # Explicit human environment delivery must consult native authorization.
+    # Literal-only and keychain-only profiles never reach op through _opg_load.
+    command op vault list --format=json >/dev/null || return $?
+    local OPGATE_NO_SESSION_CACHE=1
+    _opg_vals=() _opg_names=() _opg_kcnames=() _opg_mtime=() _opg_hash=()
+    _opg_run "$@"
+}
+
+_opg_fnox_resolve() {
+    local file="$1"
+    export FNOX_CONFIG_DIR="$_opg_persist_dir/fnox/config"
+    export FNOX_STATE_DIR="$_opg_persist_dir/fnox/state"
+    export XDG_RUNTIME_DIR="$_opg_persist_dir/fnox/runtime"
+    export FNOX_PROFILE=default
+    _opg_capture command fnox --config "$file" --non-interactive --if-missing error exec -- /usr/bin/env -0 || return $?
+    print -rn -- "$REPLY"
+}
+
+_opg_fnox_exec() {
+    local profile="$1" env_file auth file hash dump kv var; shift
+    _opg_select_profile "$profile" || return $?
+    env_file="$REPLY"
+    auth="$(_opg_auth "$env_file")" || return 1
+    [[ "$auth" == token\ * ]] || { print -u2 -- "opgate: fnox caching requires a service account profile"; return 2 }
+    (( ${+commands[fnox]} )) || { print -u2 -- "opgate: install fnox to use this backend"; return 1 }
+    _opg_fnox_config "$profile" "$env_file" || return $?
+    file="$REPLY"
+    hash="$(_opg_env_hash "$env_file")" || return 1
+    _opg_retry_wait "fnox-$profile" "$hash" && return 1
+    dump="$(_opg_auth_run "$auth" _opg_fnox_resolve "$file")" || {
+        _opg_retry_record "fnox-$profile" "$hash"; return 1
+    }
+    rm -f "$(_opg_retry_file "fnox-$profile")" "$_opg_persist_dir/fnox-$profile.retry"
+    local -A values
+    for kv in ${(0)dump}; do
+        var="${kv%%=*}"
+        (( ${_opg_p_names[(Ie)$var]} )) && values[$var]="${kv#*=}"
+    done
+    local -a assigns
+    for var in "${_opg_p_names[@]}"; do
+        (( ${+values[$var]} )) || { print -u2 -- "opgate: fnox did not resolve '$var'"; return 1 }
+        assigns+=("$var=${values[$var]}")
+    done
+    # The selected application receives values, never the resolver's service token.
+    (
+        _opg_scrub_credentials
+        # Bare export prints the inherited environment, including unrelated secrets.
+        if (( ${#assigns} )); then export "${assigns[@]}"; fi
+        "$@"
+    )
+}
+
+_opg_explicit() {
+    local mode="$1" profile="" backend=native; shift
+    while (( $# )); do
+        case "$1" in
+            -h|--help) _opg_help "$mode"; return $? ;;
+            --profile|--backend)
+                (( $# >= 2 )) || { print -u2 -- "opgate: missing option value"; return 2 }
+                if [[ "$1" == --profile ]]; then profile="$2"; else backend="$2"; fi
+                shift 2 ;;
+            --) shift; break ;;
+            *) print -u2 -- "opgate: expected --profile <name> [--backend native|fnox] -- <command>"; return 2 ;;
+        esac
+    done
+    # Only exact help forms bypass authentication. Do not mistake option values
+    # (for example an item title of '--help') for a request to display help.
+    if [[ "$mode" == op ]] && _opg_is_native_help "$@"; then
+        ( _opg_scrub_credentials; command op "$@" ); return $?
+    fi
+    [[ -n "$profile" && $# -gt 0 ]] || { print -u2 -- "opgate: profile and command are required (opgate $mode --help)"; return 2 }
+    [[ "$backend" == (native|fnox) ]] || { print -u2 -- "opgate: unknown backend '$backend'"; return 2 }
+    _opg_select_profile "$profile" || return $?
+    if [[ "$mode" != exec && "$backend" != native ]]; then
+        print -u2 -- "opgate: --backend applies only to exec"; return 2
+    fi
+    case "$mode" in
+        op) _opg_native "$profile" "$@" ;;
+        session) _opg_session "$profile" "$@" ;;
+        exec)
+            local _opg_clean_child=1
+            if [[ "$backend" == fnox ]]; then _opg_fnox_exec "$profile" "$@"
+            else
+                local auth
+                auth="$(_opg_auth "$REPLY")" || return 1
+                [[ "$auth" != default ]] || {
+                    print -u2 -- "opgate: explicit exec requires an account or token-file directive"; return 2
+                }
+                if [[ "$auth" == account\ * ]]; then
+                    _opg_auth_run "$auth" _opg_account_exec "$profile" "$@"
+                else
+                    _opg_run "$profile" "$@"
+                fi
+            fi ;;
+
+    esac
+}
+
+_opg_is_native_help() {
+    case "$*" in
+        --help|-h|'item --help'|'item -h'|'vault --help'|'vault -h'|'document --help'|'document -h'|'account --help'|'account -h'|'read --help'|'read -h'|'whoami --help'|'whoami -h')
+            # The argument count prevents quoted command strings from matching.
+            (( $# <= 2 )) || return 1 ;;
+        *)
+            (( $# == 3 )) && [[ "$3" == (-h|--help) ]] || return 1
+            case "$1 $2" in
+                'item get'|'item list'|'item create'|'item edit'|'item delete'|'item archive'|'item move'|'item copy'|'vault get'|'vault list'|'document get'|'document list'|'document create'|'document edit'|'document delete'|'account list'|'account ls') ;;
+                *) return 1 ;;
+            esac ;;
+    esac
+    return 0
+}
+
+_opg_accounts() (
+    while (( $# )); do
+        case "$1" in
+            -h|--help) _opg_help accounts; return $? ;;
+            --format=json|--format=table) break ;;
+            --format)
+                [[ "${2:-}" == (json|table) ]] && (( $# == 2 )) && break
+                print -u2 'opgate accounts: use --format json|table'; return 2 ;;
+            *) print -u2 'opgate accounts: use --format json|table'; return 2 ;;
+        esac
+    done
+    if (( $# > 1 )) && [[ "$1" != --format ]]; then
+        print -u2 'opgate accounts: unexpected arguments'; return 2
+    fi
+    # account list inspects local CLI account metadata. It does not sign in or
+    # enumerate service accounts, and must not inherit resolver credentials.
+    local -a native_args=("$@")
+    # 1Password calls its table format "human-readable".
+    if [[ "${1:-}" == --format=table ]]; then native_args=(--format=human-readable)
+    elif [[ "${1:-}" == --format && "${2:-}" == table ]]; then native_args=(--format human-readable)
+    fi
+    _opg_scrub_credentials
+    command op account list "${native_args[@]}"
+)
+
+_opg_help() {
+    case "${1:-}" in
+        '') _opg_usage ;;
+        exec) cat <<'EOF'
+usage: opgate exec --profile <name> [--backend native|fnox] -- <command> [args...]
+Inject the profile's environment values into one command.
+native is the default. fnox requires a service-account profile with static references.
+Account profiles require native approval. Help never requests approval.
+Example: opgate exec --profile agent --backend fnox -- some-tool
+EOF
+            ;;
+        op) cat <<'EOF'
+usage: opgate op --profile <name> -- <op arguments>
+Read or change items/documents, list/read vaults, read a reference, or run whoami.
+Use account list for local CLI account metadata, not service-account vault permissions.
+Writes invalidate local caches. Results can contain secrets; consume them within the command.
+Examples:
+  opgate op --profile agent -- vault list
+  opgate op --profile agent -- item list --vault agents
+  opgate op -- item create --help
+EOF
+            ;;
+        session) cat <<'EOF'
+usage: opgate session --profile personal|work -- <command> [args...]
+Request native approval for the selected account, then start the command.
+Requires an account profile; service-account profiles cannot open account sessions.
+Native approval can expire or be revoked during the command.
+Example: opgate session --profile personal -- codex
+EOF
+            ;;
+        accounts|account) cat <<'EOF'
+usage: opgate accounts [--format json|table]
+alias: opgate account list [--format json|table]
+List users and accounts configured in the local 1Password CLI, without signing in.
+This is not a list of service accounts or vault permissions.
+Use opgate ls for environment profiles, or opgate op --profile agent -- vault list for accessible vaults.
+EOF
+            ;;
+        ls|list) cat <<'EOF'
+usage: opgate ls
+List profiles, environment sources, native cache state, and fnox configuration state.
+The fnox footer shows its isolated daemon and shared cache entry count.
+configured means the current fnox configuration exists; it does not prove cached values exist for that profile.
+Listing never resolves secrets, starts the daemon, or requests 1Password approval.
+EOF
+            ;;
+        init) print 'usage: opgate init <profile> [--account <account> | --token-file <path>]'; print 'Create a new reference profile without overwriting an existing profile.' ;;
+        read) print 'usage: opgate read <VAR>'; print 'Print one native cached value without invoking 1Password. Do not print secrets in agent transcripts.' ;;
+        approve) print 'usage: opgate approve'; print 'Sign in and warm all native profile caches. This can request approval and consume provider requests.' ;;
+        flush) print 'usage: opgate flush [--session]'; print 'Invalidate both local backends. --session removes only the current native session cache.' ;;
+        invalidate) print 'usage: opgate invalidate'; print 'Invalidate local caches after external or remote vault changes. This does not synchronize machines.' ;;
+        keychain) print 'usage: opgate keychain set|rm|ls [<service>[/<account>]]'; print 'Manage keychain references. set reads a secret through protected input; ls reports availability without values.' ;;
+        version) print 'usage: opgate version | --version'; print 'Print the installed opgate version.' ;;
+        help) print 'usage: opgate help [command]'; print 'Commands also accept -h and --help.' ;;
+        *) print -u2 -- "opgate: unknown help topic '$1'"; return 2 ;;
+    esac
+}
+
 _opg_usage() {
     cat <<'EOF'
 opgate — scoped, cached 1Password secrets for shells and AI agents
 
 usage:
   opgate <profile> [--] <command> [args...]   run command with the profile's secrets
-  opgate ls                                   list profiles, source, cache state
+  opgate exec --profile <name> [--backend native|fnox] -- <command>
+                                              inject selected environment values
+  opgate op --profile <name> -- <op arguments>  read or change vault items
+  opgate session --profile personal|work -- <command>
+                                              approve native account access
+  opgate invalidate                           invalidate all local profile caches
+  opgate ls                                   list profiles and native/fnox cache state
+  opgate accounts [--format json|table]        list local CLI accounts (no sign-in)
+  opgate account list                        alias for accounts
   opgate read <VAR>                           print one value (never invokes op)
   opgate approve                              sign in and warm every profile
   opgate flush [--session]                    drop caches (--session: this session only)
@@ -970,7 +1467,8 @@ usage:
                                               scaffold a new profile
   opgate keychain set|rm|ls [<service>[/<account>]]
                                               manage the macOS keychain source
-  opgate help | version
+  opgate help [command] | version
+  opgate <command> --help                    command help without authentication
 
 Profiles live in $OPGATE_DIR (default ~/.config/opgate) as <name>.env files of
 references, never values. Two sources resolve, mixable in one profile:
@@ -989,14 +1487,32 @@ opgate() {
     emulate -L zsh
     _opg_init
     local cmd="${1:-}"
+    # Handle help before any command that could authenticate, mutate, or read values.
     case "$cmd" in
-        ""|help|-h|--help) _opg_usage ;;
+        ls|list|accounts|account|read|approve|flush|invalidate|init|keychain|version|help)
+            if [[ "${2:-}" == (-h|--help) ]]; then _opg_help "$cmd"; return $?; fi ;;
+    esac
+    if [[ "$cmd" == keychain && "${3:-}" == (-h|--help) ]]; then _opg_help keychain; return $?; fi
+    case "$cmd" in
+        ""|-h|--help) _opg_usage ;;
+        help) shift; (( $# <= 1 )) || { print -u2 'usage: opgate help [command]'; return 2; }; _opg_help "${1:-}" ;;
         version|-v|--version) print -r -- "opgate $OPGATE_VERSION" ;;
         ls|list)  _opg_ls ;;
+        accounts) shift; _opg_accounts "$@" ;;
+        account)
+            shift
+            [[ "${1:-}" == (list|ls) ]] || { _opg_help accounts >&2; return 2; }
+            shift; _opg_accounts "$@" ;;
+        exec|op|session) shift; _opg_explicit "$cmd" "$@" ;;
+        invalidate) _opg_invalidate ;;
         keychain) shift; _opg_keychain "$@" ;;
         read)     shift; _opg_read "$@" ;;
         approve)  shift; _opg_approve "$@" ;;
-        flush)    shift; _opg_flush "$@" ;;
+        flush)
+            shift
+            if [[ "${1:-}" == (--session|-s) ]]; then _opg_flush "$@"
+            else _opg_invalidate; fi ;;
+
         init)     shift; _opg_initcmd "$@" ;;
         *)
             shift

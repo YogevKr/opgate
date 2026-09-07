@@ -16,4 +16,6 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -y -q zsh
       - name: Run test suite
-        run: zsh test/run.zsh
+        run: |
+          zsh test/run.zsh
+          zsh test/discovery.zsh

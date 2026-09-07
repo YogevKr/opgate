@@ -7,6 +7,9 @@ setopt err_return no_unset pipe_fail
 local here="${0:A:h}"
 local root="${here:h}"
 local work; work="$(mktemp -d)"
+# Keep user startup files from replacing the fake CLI PATH in child shells.
+export ZDOTDIR="$work/zdot"
+mkdir -p "$ZDOTDIR"
 trap 'rm -rf "$work"' EXIT
 
 # --- fake op ---------------------------------------------------------------
@@ -20,8 +23,10 @@ cat > "$work/fakebin/op" <<'FAKE'
 emulate -L zsh
 setopt extended_glob
 print -r -- "argv=$* acct=${OP_ACCOUNT:-} satok=${OP_SERVICE_ACCOUNT_TOKEN:+SET}" >> "$OP_FAKE_LOG"
+[[ -n "${OP_FAKE_AUTH_LOG:-}" ]] && print -r -- "${OP_SESSION:+SET}:${OP_SESSION_test:+SET}" >> "$OP_FAKE_AUTH_LOG"
 case "$1" in
     run)
+        if [[ -n "${OP_FAKE_REQUIRE_SESSION:-}" && -z "${OP_SESSION:-}${OP_SESSION_test:-}" ]]; then exit 8; fi
         # Outage knobs for the failure-posture tests: OP_FAKE_FAIL simulates a
         # rate-limited account, OP_FAKE_HANG a resolver that never answers.
         [[ -n "${OP_FAKE_FAIL:-}" ]] && { print -u2 -- "op: too many requests (fake)"; exit 9 }
@@ -51,6 +56,8 @@ case "$1" in
         ;;
     "account") print -r -- "URL  EMAIL  ID"; print -r -- "test.1password.com x y" ;;
     signin) print -r -- "" ;;
+    item) [[ -n "${OP_FAKE_ITEM_FAIL:-}" ]] && exit 9; print -r -- "item-ok" ;;
+    vault) [[ -n "${OP_FAKE_APPROVAL_FAIL:-}" ]] && exit 9; print -r -- "[]" ;;
 esac
 FAKE
 chmod +x "$work/fakebin/op"
@@ -175,6 +182,9 @@ t() {  # t <name> <expected> <actual>
 opcalls() { grep -c '^argv=run' "$OP_FAKE_LOG" 2>/dev/null || print 0 }
 
 # --- tests -----------------------------------------------------------------
+# Host startup files can source an installed opgate before fixture setup.
+unset _opg_dir _opg_session_dir _opg_session_key_cached _opg_persist_dir _opg_revision
+unset _opg_vals _opg_names _opg_kcnames _opg_mtime _opg_hash
 source "$root/opgate.zsh"
 
 # 1. resolution + plain passthrough
@@ -262,10 +272,10 @@ t "mixed op calls" "$(( before + 1 ))" "$(opcalls)"
 
 # 17. the security property: keychain values are never written to a cache file.
 #     The op-sourced half of the same profile is cached as usual.
-out="$(cat "$work/tmp/opgate-session/test-session.mixed" 2>/dev/null | base64 -d 2>/dev/null || true)"
+out="$(cat "$work/tmp/opgate-session/test-session.mixed.v4" 2>/dev/null | base64 -d 2>/dev/null || true)"
 [[ "$(grep -rl 'kc-secret' "$work/tmp" "$work/persist" 2>/dev/null | wc -l | tr -d ' ')" == 0 ]] \
     && t "keychain value uncached" "yes" "yes" || t "keychain value uncached" "yes" "no"
-grep -q 'MIXOP' "$work/tmp/opgate-session/test-session.mixed" 2>/dev/null \
+grep -q 'MIXOP' "$work/tmp/opgate-session/test-session.mixed.v4" 2>/dev/null \
     && t "op value still cached" "yes" "yes" || t "op value still cached" "yes" "no"
 
 # 18. read serves keychain values live, still without invoking op
@@ -402,6 +412,14 @@ grep -q "serving stale" "$work/stale.err" \
 grep -q "missing: OUT2" "$work/stale.err" \
     && t "outage: missing vars named" "yes" "yes" || t "outage: missing vars named" "yes" "no"
 
+# New shells must reuse the failure delay, including when op would now work.
+local retry_calls; retry_calls=$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')
+out="$(OPGATE_CACHE_TTL_DAYS=30 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'" 2>"$work/retry.err")"
+t "retry: stale remains available" "resolved:OUT1" "$out"
+t "retry: new process does not call op" "$retry_calls" "$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+grep -q "retry delayed" "$work/retry.err" \
+    && t "retry: delay warns" "yes" "yes" || t "retry: delay warns" "yes" "no"
+
 # 27. the knob: fail-hard is still available
 OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_FAIL=1 OPGATE_STALE_FALLBACK=0 \
     zsh -c "source '$root/opgate.zsh'; opgate outage /usr/bin/true" 2>/dev/null \
@@ -409,10 +427,176 @@ OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_FAIL=1 OPGATE_STALE_FALLBACK=0 \
     || t "outage: fallback off fails" "nonzero" "nonzero"
 
 # 28. a hung op is killed, and the stale path still answers afterwards
-out="$(OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_HANG=60 OPGATE_OP_TIMEOUT=2 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'" 2>"$work/hang.err")"
+out="$(OPGATE_RETRY_SECONDS=0 OPGATE_CACHE_TTL_DAYS=30 OP_FAKE_HANG=60 OPGATE_OP_TIMEOUT=2 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT1'" 2>"$work/hang.err")"
 t "outage: hung op killed, stale served" "resolved:OUT1" "$out"
 grep -q "exceeded 2s" "$work/hang.err" \
     && t "outage: timeout warns" "yes" "yes" || t "outage: timeout warns" "yes" "no"
+
+# A cold profile has no stale value. Repeated calls still stop at one failure.
+print -r -- "COLD=op://vault/item/cold" > "$work/profiles/cold.env"
+retry_calls=$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')
+for attempt in 1 2 3; do
+    OP_FAKE_FAIL=1 zsh -c "source '$root/opgate.zsh'; opgate cold /usr/bin/true" 2>/dev/null \
+        && t "retry: cold failure $attempt" "nonzero" "zero" \
+        || t "retry: cold failure $attempt" "nonzero" "nonzero"
+done
+t "retry: one cold request" "$(( retry_calls + 1 ))" "$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+
+# Editing the references permits a new resolve and clears the failure marker.
+print -r -- "COLD=op://vault/item/repaired" > "$work/profiles/cold.env"
+out="$(zsh -c "source '$root/opgate.zsh'; opgate cold /bin/sh -c 'echo \$COLD'")"
+t "retry: profile edit permits recovery" "resolved:COLD" "$out"
+
+# The explicit override permits recovery before the delay expires.
+out="$(OPGATE_RETRY_SECONDS=0 OPGATE_CACHE_TTL_DAYS=30 zsh -c "source '$root/opgate.zsh'; opgate outage /bin/sh -c 'echo \$OUT2'")"
+t "retry: explicit retry recovers" "resolved:OUT2" "$out"
+
+# Expired markers permit recovery without requiring a profile edit.
+print -r -- "EXPIRED=op://vault/item/expired" > "$work/profiles/expired.env"
+zsh -c 'source "$1/opgate.zsh"; _opg_init; print -r -- "$(( EPOCHSECONDS - 7200 )) $(_opg_env_hash "$OPGATE_DIR/expired.env") ${_opg_revision:-}" > "$_opg_persist_dir/expired.v4.retry"' -- "$root"
+out="$(zsh -c "source '$root/opgate.zsh'; opgate expired /bin/sh -c 'echo \$EXPIRED'")"
+t "retry: elapsed delay recovers" "resolved:EXPIRED" "$out"
+
+# Explicit account and service account interfaces do not load environment profiles.
+local count_before
+count_before="$(opcalls)"
+t "native item read" "item-ok" "$(opgate op --profile agents -- item get example)"
+t "native read avoids environment resolve" "$count_before" "$(opcalls)"
+out="$(OP_SERVICE_ACCOUNT_TOKEN=wrong OP_ACCOUNT=wrong opgate op --profile personal -- item list)"
+t "personal ignores inherited service token" "argv=item list acct=test.1password.com satok=" "$(tail -1 "$OP_FAKE_LOG")"
+out="$(OP_ACCOUNT=wrong opgate op --profile agents -- item list)"
+t "agent ignores inherited account" "argv=item list acct= satok=SET" "$(tail -1 "$OP_FAKE_LOG")"
+opgate op --profile ../agents -- item list >/dev/null 2>&1 \
+    && t "invalid profile rejected" "yes" "no" || t "invalid profile rejected" "yes" "yes"
+opgate op --profile personal -- item list --account=other >/dev/null 2>&1 \
+    && t "account override rejected" "yes" "no" || t "account override rejected" "yes" "yes"
+
+# Sessions require native approval and preserve the child's exit code.
+t "session account" "test.1password.com:" "$(OP_SERVICE_ACCOUNT_TOKEN=wrong opgate session --profile personal -- /bin/sh -c 'printf "%s:%s" "$OP_ACCOUNT" "${OP_SERVICE_ACCOUNT_TOKEN-}"')"
+OP_FAKE_APPROVAL_FAIL=1 opgate session --profile personal -- touch "$work/should-not-run" >/dev/null 2>&1 || true
+[[ ! -e "$work/should-not-run" ]] \
+    && t "denied approval stops child" "yes" "yes" || t "denied approval stops child" "yes" "no"
+local child_rc=0
+opgate session --profile personal -- /bin/sh -c 'exit 7' || child_rc=$?
+t "session preserves exit" "7" "$child_rc"
+opgate session --profile agents -- /usr/bin/true >/dev/null 2>&1 \
+    && t "service account rejects session mode" "yes" "no" || t "service account rejects session mode" "yes" "yes"
+
+# Explicit human exec cannot reuse a warm legacy cache as authorization.
+count_before="$(opcalls)"
+opgate exec --profile personal -- /usr/bin/true
+opgate exec --profile personal -- /usr/bin/true
+t "explicit human exec consults op each time" "$(( count_before + 2 ))" "$(opcalls)"
+
+# Account authorization also applies when profile values need no 1Password read.
+print -r -- '# opgate:account test.1password.com' > "$work/profiles/personal-local.env"
+print -r -- 'LOCAL=public-value' >> "$work/profiles/personal-local.env"
+OP_FAKE_APPROVAL_FAIL=1 opgate exec --profile personal-local -- touch "$work/local-only-child" >/dev/null 2>&1 || true
+[[ ! -e "$work/local-only-child" ]] && t 'local-only account denial stops child' yes yes || t 'local-only account denial stops child' yes no
+t 'local-only account consults native approval' 'argv=vault list --format=json acct=test.1password.com satok=' "$(tail -1 "$OP_FAKE_LOG")"
+t 'approved local-only account executes child' public-value "$(opgate exec --profile personal-local -- /bin/sh -c 'printf %s "$LOCAL"')"
+
+# Another process invalidates a warm parent memory cache and a different session file.
+opgate agents /usr/bin/true
+OPGATE_SESSION_KEY=other-session zsh -c "source '$root/opgate.zsh'; opgate agents /usr/bin/true"
+count_before="$(opcalls)"
+zsh -c "source '$root/opgate.zsh'; opgate op --profile agents -- item edit example" >/dev/null
+opgate agents /usr/bin/true
+t "write invalidates parent memory" "$(( count_before + 1 ))" "$(opcalls)"
+OPGATE_SESSION_KEY=other-session zsh -c "source '$root/opgate.zsh'; opgate agents /usr/bin/true"
+t "write invalidates other session" "$(( count_before + 2 ))" "$(opcalls)"
+count_before="$(opcalls)"
+OP_FAKE_ITEM_FAIL=1 opgate op --profile agents -- item delete example >/dev/null 2>&1 || true
+opgate agents /usr/bin/true
+t "failed write also invalidates" "$(( count_before + 1 ))" "$(opcalls)"
+
+# fnox must not convert human approval into a cross-session secret cache.
+opgate exec --profile personal --backend fnox -- /usr/bin/true >/dev/null 2>&1 \
+    && t "human fnox cache rejected" "yes" "no" || t "human fnox cache rejected" "yes" "yes"
+t "explicit native exec" "resolved:BAR" "$(opgate exec --profile agents -- /bin/sh -c 'echo $BAR')"
+
+# Both supported session credential forms stay out of explicit access modes.
+export OP_FAKE_AUTH_LOG="$work/auth.log"
+out="$(OP_SESSION=fixture OP_SESSION_test=fixture opgate op --profile personal -- item list)"
+t "explicit native removes both session forms" ":" "$(tail -1 "$OP_FAKE_AUTH_LOG")"
+out="$(OP_SESSION=fixture OP_SESSION_test=fixture opgate session --profile personal -- /bin/sh -c 'printf "%s:%s" "${OP_SESSION-unset}" "${OP_SESSION_test-unset}"')"
+t "session child receives no manual tokens" "unset:unset" "$out"
+out="$(OP_SESSION=fixture OP_SESSION_test=fixture opgate exec --profile agents -- /bin/sh -c 'printf "%s:%s" "${OP_SESSION-unset}" "${OP_SESSION_test-unset}"')"
+t "explicit native exec removes manual tokens" "unset:unset" "$out"
+
+# Existing manual sign-in remains usable in the legacy environment interface.
+print -r -- '# opgate:account test.1password.com' > "$work/profiles/manual.env"
+print -r -- 'MANUAL=op://vault/item/field' >> "$work/profiles/manual.env"
+out="$(OP_SESSION=fixture OP_FAKE_REQUIRE_SESSION=1 opgate manual /bin/sh -c 'printf %s "$MANUAL"')"
+t "legacy manual session retained" "resolved:MANUAL" "$out"
+opgate flush
+out="$(OP_SESSION_test=fixture OP_FAKE_REQUIRE_SESSION=1 opgate manual /bin/sh -c 'printf %s "$MANUAL"')"
+t "legacy prefixed session retained" "resolved:MANUAL" "$out"
+unset OP_FAKE_AUTH_LOG
+
+# Existing persistent caches migrate without a provider request. Old and new
+# writers use different filenames, so mixed shell versions cannot clobber them.
+OPGATE_CACHE_DIR="$work/migrate" OPGATE_SESSION_KEY=migrate OPGATE_CACHE_TTL_DAYS=1 \
+    zsh -c 'source "$1/opgate.zsh"; opgate agents /usr/bin/true' -- "$root"
+sed '/^#revision /d' "$work/migrate/agents.v4.cache" > "$work/migrate/agents.cache"
+rm "$work/migrate/agents.v4.cache" "$work/tmp/opgate-session/migrate.agents.v4"
+count_before="$(opcalls)"
+out="$(OPGATE_CACHE_DIR="$work/migrate" OPGATE_SESSION_KEY=migrate OPGATE_CACHE_TTL_DAYS=1 \
+    zsh -c 'source "$1/opgate.zsh"; opgate agents /bin/sh -c '\''printf %s "$BAR"'\''' -- "$root")"
+t "legacy cache migration value" "resolved:BAR" "$out"
+t "legacy cache migration avoids provider" "$count_before" "$(opcalls)"
+[[ -e "$work/tmp/opgate-session/migrate.agents.v4" && -e "$work/migrate/agents.cache" ]] \
+    && t "cache versions use separate files" "yes" "yes" || t "cache versions use separate files" "yes" "no"
+
+# Explicit exec rejects implicit credentials even when a legacy cache exists.
+print -r -- 'IMPLICIT=plain' > "$work/profiles/implicit.env"
+opgate implicit /usr/bin/true
+opgate exec --profile implicit -- touch "$work/implicit-child" >/dev/null 2>&1 \
+    && t "explicit exec requires authentication directive" "yes" "no" \
+    || t "explicit exec requires authentication directive" "yes" "yes"
+[[ ! -e "$work/implicit-child" ]] \
+    && t "implicit exec cannot start child" "yes" "yes" || t "implicit exec cannot start child" "yes" "no"
+
+# A resolve started before a write can fail later. Its retry marker is obsolete.
+local old_revision="$_opg_revision"
+opgate invalidate
+( _opg_revision="$old_revision"; _opg_retry_record agents "$(_opg_env_hash "$work/profiles/agents.env")" )
+count_before="$(opcalls)"
+opgate agents /usr/bin/true
+t "obsolete retry cannot block a new revision" "$(( count_before + 1 ))" "$(opcalls)"
+
+# Rapid writes must not share a revision through zsh's subshell RANDOM state.
+local -A revisions
+for attempt in {1..10}; do
+    opgate invalidate
+    revisions[$_opg_revision]=1
+done
+t "rapid invalidation identifiers are distinct" 10 "${#revisions}"
+
+# Successful recovery also removes the migrated legacy retry marker.
+print -r -- "$EPOCHSECONDS $(_opg_env_hash "$work/profiles/agents.env")" > "$work/migrate/agents.retry"
+OPGATE_CACHE_DIR="$work/migrate" OPGATE_SESSION_KEY=retry-recovery OPGATE_RETRY_SECONDS=0 \
+    zsh -c 'source "$1/opgate.zsh"; opgate agents /usr/bin/true' -- "$root"
+[[ ! -e "$work/migrate/agents.retry" ]] \
+    && t "successful recovery clears legacy retry" "yes" "yes" || t "successful recovery clears legacy retry" "yes" "no"
+
+# A newline-only token must not fall back to desktop account authorization.
+printf '\n' > "$work/empty-token"
+print -r -- "# opgate:token-file $work/empty-token" > "$work/profiles/empty-token.env"
+count_before="$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+opgate op --profile empty-token -- item list >/dev/null 2>&1 \
+    && t "empty token fails closed" "yes" "no" || t "empty token fails closed" "yes" "yes"
+t "empty token never invokes op" "$count_before" "$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+
+# No resolved variables means there is nothing to export, not an env dump.
+local empty_rc=0
+out="$(opgate exec --profile empty-token -- /bin/sh -c 'printf child-only' 2>/dev/null)" || empty_rc=$?
+t 'empty native profile is rejected' 1 "$empty_rc"
+[[ -z "$out" ]] && t 'empty native profile keeps output clean' yes yes || t 'empty native profile keeps output clean' yes no
+empty_rc=0
+out="$(opgate empty-token /bin/sh -c 'printf child-only' 2>/dev/null)" || empty_rc=$?
+t 'empty legacy profile is rejected' 1 "$empty_rc"
+[[ -z "$out" ]] && t 'empty legacy profile keeps output clean' yes yes || t 'empty legacy profile keeps output clean' yes no
 
 print
 print -r -- "passed $pass, failed $fail"
