@@ -69,11 +69,18 @@
 # persistent blob is served stale with a stderr warning rather than failing
 # the caller (OPGATE_STALE_FALLBACK=0 restores fail-hard). Stale serves stay
 # in memory only. Failed resolves share a retry delay across processes.
+#
+# Approval holder: the desktop-app integration ties an authorization to the
+# process session op runs in, and an agent tool call is a fresh session with
+# no terminal — so every op call from an agent was a new terminal to the app,
+# and a new Touch ID prompt. Without a terminal on stdin, account-profile op
+# calls run inside one long-lived session per agent session instead (see
+# _opg_holder_main): approve once, and the rest of the session rides it.
 
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.4.1
+typeset -g OPGATE_VERSION=0.5.0
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -94,6 +101,10 @@ _opg_init() {
     [[ -n "${_opg_session_ttl:-}" ]] || typeset -g _opg_session_ttl="${OPGATE_SESSION_TTL:-43200}"   # 12h
     [[ -n "${_opg_persist_dir:-}" ]] || typeset -g _opg_persist_dir="${OPGATE_CACHE_DIR:-$HOME/.cache/opgate}"
     typeset -g _opg_persist_ttl=$(( ${OPGATE_CACHE_TTL_DAYS:-0} * 86400 ))
+    # Decided here, at the entry point: the resolver runs op from a background
+    # job, and a background job never has the terminal on stdin.
+    typeset -g _opg_stdin_tty=0
+    [[ -t 0 ]] && _opg_stdin_tty=1
     # A revision change invalidates caches in other, already-running shells.
     local revision=""
     [[ -r "$_opg_persist_dir/revision" ]] && read -r revision < "$_opg_persist_dir/revision"
@@ -316,9 +327,15 @@ _opg_terminal_key() {
 # env (Codex does) key a child job to the parent session and reuse its cache;
 # a standalone run keys to its own thread; a plain terminal to its app.
 _opg_session_key() {
+    _opg_cache_enabled || return 1
+    _opg_session_key_raw
+}
+
+# The key without the cache switch: the approval holder is keyed the same way
+# but is not a cache, so OPGATE_NO_SESSION_CACHE must not disable it.
+_opg_session_key_raw() {
     [[ -n "${_opg_session_key_cached:-}" ]] && { print -r -- "$_opg_session_key_cached"; return 0 }
     local key
-    _opg_cache_enabled || return 1
     if   [[ -n "${OPGATE_SESSION_KEY:-}" ]];      then key="$OPGATE_SESSION_KEY"
     elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]];  then key="claude-$CLAUDE_CODE_SESSION_ID"
     elif [[ -n "${CODEX_THREAD_ID:-}" ]];         then key="codex-$CODEX_THREAD_ID"
@@ -633,7 +650,7 @@ _opg_load() {
         _opg_op_dump "$env_file" || rc=$?
         dump="$REPLY"; unset REPLY
     else
-        dump="$(_opg_auth_run "$auth" _opg_capture_print op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || rc=$?
+        dump="$(_opg_auth_run "$auth" _opg_capture_print _opg_op run --no-masking --env-file="$env_file" -- /usr/bin/env -0)" || rc=$?
     fi
     if (( rc != 0 )); then
         _opg_retry_record "$profile" "${hash:-}"
@@ -669,7 +686,7 @@ _opg_load() {
 # OPGATE_OP_TIMEOUT=<seconds> tunes it; 0 restores the unbounded call.
 _opg_op_dump() {
     local env_file="$1"
-    _opg_capture op run --no-masking --env-file="$env_file" -- /usr/bin/env -0
+    _opg_capture _opg_op run --no-masking --env-file="$env_file" -- /usr/bin/env -0
 }
 
 _opg_capture() {
@@ -791,7 +808,7 @@ _opg_flush() {
     _opg_vals=() _opg_names=() _opg_kcnames=() _opg_mtime=()
     local key profile
     if key="$(_opg_session_key)" && [[ -d "$_opg_session_dir" ]]; then
-        rm -f "$_opg_session_dir/${key}."*(N)
+        rm -f "$_opg_session_dir/${key}."*(N.)   # files only; the holder dir stays
     fi
     [[ "$1" == (--session|-s) ]] && return 0
     for profile in $(_opg_profiles); do
@@ -844,7 +861,7 @@ _opg_approve_one() {
                 print -u2 -- "skipping $profile — no account '$account' on this machine (op account add)"
                 return 1
             fi
-            eval "$(op signin --account "$account" 2>/dev/null)" 2>/dev/null
+            eval "$(_opg_op signin --account "$account" 2>/dev/null)" 2>/dev/null
             ;;
     esac
     unset "_opg_names[$profile]"
@@ -908,6 +925,7 @@ _opg_ls() {
         printf '%-14s %-38s %2s vars   native: %s; fnox: %s\n' "$profile" "[${auth}]" "$nvars" "$state" "$fnox_state"
     done
     _opg_fnox_status
+    _opg_approval_line
 }
 
 # opgate keychain set|rm|ls — the write side of the keychain source. There is
@@ -1073,6 +1091,250 @@ _opg_auth_run() (
     "$@"
 )
 
+# --- approval holder -------------------------------------------------------
+# The desktop-app integration ties an authorization to the process session
+# `op` runs in: a terminal's for a human and — measured against op 2.35 with
+# 1Password 8 on 2026-09-11 — the process session id when there is no tty.
+# Agent harnesses (Claude Code, Codex) run every tool call in a fresh session
+# with no tty, so each op call arrived as a new terminal and the app asked for
+# Touch ID again, for every command:
+#
+#   op vault list                  no tty     NmRequestAuthorization, each shell
+#   setsid op vault list           no tty     a new request (session-keyed)
+#   op vault list </dev/ttys008    no tty     still a new request per shell
+#   op inside one long-lived session         one request; later calls ride it
+#
+# So without a terminal on stdin, account-profile op calls go through a
+# holder: a forked copy of the shell in its own session (a zpty child, which
+# is what a terminal is to the kernel), keyed like the session cache — Claude Code
+# session, else Codex thread, else the terminal app. It runs op on the
+# caller's behalf and relays stdin, stdout, stderr and the exit status through
+# 0600 files under the session directory. One approval per agent session. The
+# holder exits with the session (`opgate flush --session`, the SessionEnd
+# hook) or at the 12h session TTL, and keeps the approval from idling out with
+# `op whoami` every OPGATE_APPROVAL_KEEPALIVE seconds (default 480, 0 = off).
+# Service-account profiles never use it: they never prompt. A terminal on
+# stdin never uses it: that terminal is already its own session.
+# OPGATE_APPROVAL=call restores the bare call.
+#
+# Exposure, stated plainly: while the holder lives, any process running as
+# this user that can write under the session directory can run op on the
+# approved account through it. That is the class the terminal session and the
+# session cache already sit in, not a new one — but it is the whole account,
+# not one scoped vault, so agents that only need a service account should
+# keep using one.
+
+_opg_holder_dir() {
+    local key
+    key="$(_opg_session_key_raw)" || return 1
+    print -r -- "$_opg_session_dir/${key}.holder"
+}
+
+# Both layers are forks of the caller and inherit every open descriptor,
+# including the write end of whatever command substitution or pipe the
+# caller was inside — which would then never see EOF. Close them all.
+_opg_holder_close_fds() {
+    local fd
+    for fd in {3..255}; do exec {fd}>&- 2>/dev/null; done
+    return 0
+}
+
+# Runs inside the holder, a zpty child: zpty forks the calling shell and
+# evals its argument there, so every function and variable of the caller is
+# already present — and so is the caller's EXIT trap, which must go first
+# (a test suite's `rm -rf $work` on exit is the kind of thing it would run).
+_opg_holder_main() {
+    emulate -L zsh
+    local dir="$1" ttl="$2" keep="$3" q id acct cwd oppath rc tick last_keep=$SECONDS
+    local -a argv accounts envs
+    trap - EXIT; trap '' HUP
+    _opg_vals=()   # no resolved values idle in a long-lived process
+    _opg_holder_close_fds
+    exec </dev/null >>"$dir/log" 2>&1 || exit 1
+    # Read-write on the FIFO: never EOF when a writer leaves, and read -t can
+    # wake on its own to check the TTL, the pid file, and the keepalive.
+    exec {q}<>"$dir/queue" || exit 1
+    print -r -- $$ >| "$dir/pid" || exit 1
+    print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ started: ttl=${ttl}s keepalive=${keep}s"
+    tick=60; (( keep > 0 && keep < tick )) && tick=$keep
+    while :; do
+        (( ttl > 0 && SECONDS > ttl )) && { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session TTL reached"; break }
+        [[ -r "$dir/pid" && "$(<"$dir/pid")" == "$$" ]] || { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: pid file gone"; break }
+        id=""
+        if ! read -r -t "$tick" -u $q id; then
+            if (( keep > 0 && SECONDS - last_keep >= keep )); then
+                for acct in $accounts; do OP_ACCOUNT="$acct" command op whoami >/dev/null 2>&1; done
+                last_keep=$SECONDS
+            fi
+            continue
+        fi
+        [[ "$id" =~ '^[A-Za-z0-9._-]+$' && -r "$dir/req-$id/cmd" ]] || continue
+        argv=() acct="" cwd="" oppath=""
+        source "$dir/req-$id/cmd"
+        [[ -n "$acct" ]] && (( ! ${accounts[(Ie)$acct]} )) && accounts+=("$acct")
+        # op runs with the caller's environment, not the holder's: per-call
+        # variables (OP_ACCOUNT, the fake's knobs in the test suite) must
+        # reach it as if the caller had run op itself.
+        envs=(${(0)"$(<"$dir/req-$id/env")"})
+        rc=0
+        ( cd -q -- "${cwd:-/}" 2>/dev/null || cd -q /
+          exec /usr/bin/env -i "${envs[@]}" "${oppath:-op}" "${argv[@]}" ) \
+            <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" || rc=$?
+        print -r -- "$rc" >| "$dir/req-$id/rc"
+        last_keep=$SECONDS
+    done
+    rm -f "$dir/pid"
+    exit 0
+}
+
+# The outer of two zpty layers. zpty gives the holder its own session, the
+# way a terminal does, but once the spawner is gone the pty's master side is
+# closed — and on macOS any zsh started in a session whose pty master is
+# closed blocks forever in open("/dev/tty") (measured: the test suite's fake
+# op hung in open(2)). So this keeper opens a second pty for the real holder
+# and holds its master until the holder exits. It runs nothing else, so the
+# dead master of its own pty never bites it. It also drains that master once
+# a second: a session leader's exit waits for its tty output to drain, and
+# with nobody reading the holder sat in the kernel's exiting state forever.
+_opg_holder_keeper() {
+    emulate -L zsh
+    local line
+    trap - EXIT; trap '' HUP
+    # zpty rebinds stdin and stdout to the pty but leaves stderr, which would
+    # keep the spawner's terminal (or a test wrapper's pty) open for 12h.
+    exec </dev/null >/dev/null 2>&1
+    _opg_holder_close_fds
+    zpty -b inner "_opg_holder_main ${(q)1} ${(q)2} ${(q)3}" || exit 1
+    while zpty -t inner 2>/dev/null; do
+        zpty -r inner line 2>/dev/null
+        command sleep 1
+    done
+    exit 0
+}
+
+_opg_holder_spawn() {
+    local dir="$1" name i=0
+    zmodload zsh/zpty 2>/dev/null || return 1
+    [[ -p "$dir/queue" ]] || mkfifo -m 600 "$dir/queue" || return 1
+    : >| "$dir/log" && chmod 600 "$dir/log" || return 1
+    rm -f "$dir/pid"
+    name="opgh$$$RANDOM"
+    zpty -b "$name" "_opg_holder_keeper ${(q)dir} ${_opg_session_ttl:-43200} ${OPGATE_APPROVAL_KEEPALIVE:-480}" || return 1
+    while [[ ! -s "$dir/pid" ]] && (( i++ < 100 )); do sleep 0.05; done
+    # The keeper ignores HUP; closing its master leaves both layers running.
+    zpty -d "$name" 2>/dev/null
+    [[ -s "$dir/pid" ]]
+}
+
+# REPLY: the holder directory, spawning the holder if this session has none.
+_opg_holder_ensure() {
+    local dir pid i=0 rc=0
+    dir="$(_opg_holder_dir)" || return 1
+    if [[ -r "$dir/pid" ]]; then
+        pid="$(<"$dir/pid")"
+        [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null && { REPLY="$dir"; return 0 }
+    fi
+    mkdir -p "$dir" && chmod 700 "$dir" || return 1
+    # One spawner at a time; a second caller waits for the first's pid file.
+    if ! mkdir "$dir/spawn.lock" 2>/dev/null; then
+        while [[ -d "$dir/spawn.lock" ]] && (( i++ < 100 )); do sleep 0.05; done
+        if [[ -r "$dir/pid" ]] && kill -0 "$(<"$dir/pid")" 2>/dev/null; then REPLY="$dir"; return 0; fi
+        rmdir "$dir/spawn.lock" 2>/dev/null   # abandoned by a spawner that died
+        mkdir "$dir/spawn.lock" 2>/dev/null || return 1
+    fi
+    _opg_holder_spawn "$dir" || rc=$?
+    rmdir "$dir/spawn.lock" 2>/dev/null
+    (( rc == 0 )) || { print -u2 -- "opgate: could not start the approval holder; running op directly"; return 1 }
+    REPLY="$dir"
+}
+
+_opg_holder_stop() {
+    local dir pid
+    dir="$(_opg_holder_dir)" || return 0
+    [[ -d "$dir" ]] || return 0
+    if [[ -r "$dir/pid" ]]; then
+        pid="$(<"$dir/pid")"
+        [[ "$pid" == <-> ]] && kill -TERM "$pid" 2>/dev/null
+    fi
+    rm -rf "$dir"
+}
+
+# op takes a template or file on stdin for these; the holder must relay it.
+_opg_op_reads_stdin() {
+    local arg
+    for arg in "$@"; do [[ "$arg" == - ]] && return 0; done
+    case "$1 ${2:-}" in
+        'item create'|'item edit'|'document create'|'document edit') return 0 ;;
+    esac
+    return 1
+}
+
+# Run one op command in the holder and relay its result.
+_opg_holder_call() {
+    local dir="$1" id req pid fd i=0 rc=1 tmo="${OPGATE_OP_TIMEOUT:-120}"; shift
+    zmodload zsh/system 2>/dev/null || return 1
+    pid="$(<"$dir/pid")" 2>/dev/null || return 1
+    while :; do
+        id="$$-$RANDOM$RANDOM"; req="$dir/req-$id"
+        mkdir -m 700 "$req" 2>/dev/null && break
+        (( i++ < 5 )) || return 1
+    done
+    if _opg_op_reads_stdin "$@" && [[ -p /dev/fd/0 || -f /dev/fd/0 ]]; then
+        cat >| "$req/in"
+    else
+        : >| "$req/in"
+    fi
+    chmod 600 "$req/in"
+    ( umask 077; /usr/bin/env -0 >| "$req/env" ) || { rm -rf "$req"; return 1 }
+    print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
+    # A non-blocking open fails with ENXIO when no holder keeps the FIFO open.
+    if ! sysopen -w -o nonblock -u fd "$dir/queue" 2>/dev/null; then
+        rm -rf "$req"; print -u2 -- "opgate: approval holder is gone"; return 1
+    fi
+    print -u $fd -r -- "$id"
+    exec {fd}>&-
+    i=0
+    while [[ ! -e "$req/rc" ]]; do
+        (( tmo > 0 && i >= tmo * 20 )) && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05; (( ++i ))
+    done
+    if [[ -e "$req/rc" ]]; then
+        cat "$req/out"; cat "$req/err" >&2
+        rc="$(<"$req/rc")"
+    else
+        print -u2 -- "opgate: approval holder did not answer"
+        rc=1
+    fi
+    rm -rf "$req"
+    return $rc
+}
+
+# Every op invocation that can prompt goes through here.
+_opg_op() {
+    if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN-}" && "${_opg_stdin_tty:-1}" == 0 \
+          && "${OPGATE_APPROVAL:-session}" != (call|off|0) ]] && _opg_holder_ensure; then
+        _opg_holder_call "$REPLY" "$@"
+    else
+        command op "$@"
+    fi
+}
+
+_opg_approval_line() {
+    local dir pid
+    if [[ "${OPGATE_APPROVAL:-session}" == (call|off|0) ]]; then
+        print -r -- "approval: per op call (OPGATE_APPROVAL=call)"
+    elif (( ${_opg_stdin_tty:-1} )); then
+        print -r -- "approval: this terminal"
+    elif ! dir="$(_opg_holder_dir)"; then
+        print -r -- "approval: per op call (no session key)"
+    elif [[ -r "$dir/pid" ]] && pid="$(<"$dir/pid")" && kill -0 "$pid" 2>/dev/null; then
+        print -r -- "approval: holder pid $pid for session ${${dir:t}%.holder}"
+    else
+        print -r -- "approval: holder starts on the first account call (session ${${dir:t}%.holder})"
+    fi
+}
+
 _opg_invalidate() {
     # Publish before cache removal. Old in-flight resolves retain the old revision.
     local tmp
@@ -1109,7 +1371,7 @@ _opg_native() {
         *) print -u2 -- "opgate: supported operations are item/document reads and writes, vault reads, read, whoami, and account list"; return 2 ;;
     esac
     (( mutation )) && { _opg_invalidate || return 1 }
-    _opg_auth_run "$auth" command op "$@" || rc=$?
+    _opg_auth_run "$auth" _opg_op "$@" || rc=$?
     # Invalidate on failure too: a timeout can follow a committed remote write.
     if (( mutation )); then
         _opg_invalidate || { print -u2 -- "opgate: cache invalidation failed after a vault operation"; return 1 }
@@ -1129,7 +1391,7 @@ _opg_session() {
 }
 
 _opg_session_command() {
-    command op vault list --format=json >/dev/null || return $?
+    _opg_op vault list --format=json >/dev/null || return $?
     "$@"
 }
 
@@ -1251,7 +1513,7 @@ _opg_capture_print() {
 _opg_account_exec() {
     # Explicit human environment delivery must consult native authorization.
     # Literal-only and keychain-only profiles never reach op through _opg_load.
-    command op vault list --format=json >/dev/null || return $?
+    _opg_op vault list --format=json >/dev/null || return $?
     local OPGATE_NO_SESSION_CACHE=1
     _opg_vals=() _opg_names=() _opg_kcnames=() _opg_mtime=() _opg_hash=()
     _opg_run "$@"
@@ -1510,6 +1772,9 @@ opgate() {
         approve)  shift; _opg_approve "$@" ;;
         flush)
             shift
+            # The holder goes with the caches here, never on invalidate: vault
+            # writes invalidate, and a write must not cost the next approval.
+            _opg_holder_stop
             if [[ "${1:-}" == (--session|-s) ]]; then _opg_flush "$@"
             else _opg_invalidate; fi ;;
 

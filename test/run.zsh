@@ -10,7 +10,9 @@ local work; work="$(mktemp -d)"
 # Keep user startup files from replacing the fake CLI PATH in child shells.
 export ZDOTDIR="$work/zdot"
 mkdir -p "$ZDOTDIR"
-trap 'rm -rf "$work"' EXIT
+# Approval holders spawned under $work outlive their spawner by design; stop
+# them with the suite or they would sit there until their 12h TTL.
+trap 'local f; for f in "$work"/tmp/opgate-session/*.holder/pid(N); do kill -TERM "$(<"$f")" 2>/dev/null; done; rm -rf "$work"' EXIT
 
 # --- fake op ---------------------------------------------------------------
 # Logs every invocation; `op run` resolves op://x/y/z refs to "resolved:<VAR>"
@@ -23,6 +25,16 @@ cat > "$work/fakebin/op" <<'FAKE'
 emulate -L zsh
 setopt extended_glob
 print -r -- "argv=$* acct=${OP_ACCOUNT:-} satok=${OP_SERVICE_ACCOUNT_TOKEN:+SET}" >> "$OP_FAKE_LOG"
+# What reached stdin: the first line of a pipe or file, so the approval-identity
+# tests can tell a lent terminal from a piped template. A tty or /dev/null is
+# never read — that would block the suite.
+if [[ -n "${OP_FAKE_STDIN_LOG:-}" ]]; then
+    local first="" kind=other
+    if [[ -p /dev/fd/0 ]]; then kind=pipe; IFS= read -r first
+    elif [[ -f /dev/fd/0 ]]; then kind=file; IFS= read -r first
+    fi
+    print -r -- "$1 $kind:$first ppid=$PPID" >> "$OP_FAKE_STDIN_LOG"
+fi
 [[ -n "${OP_FAKE_AUTH_LOG:-}" ]] && print -r -- "${OP_SESSION:+SET}:${OP_SESSION_test:+SET}" >> "$OP_FAKE_AUTH_LOG"
 case "$1" in
     run)
@@ -273,7 +285,7 @@ t "mixed op calls" "$(( before + 1 ))" "$(opcalls)"
 # 17. the security property: keychain values are never written to a cache file.
 #     The op-sourced half of the same profile is cached as usual.
 out="$(cat "$work/tmp/opgate-session/test-session.mixed.v4" 2>/dev/null | base64 -d 2>/dev/null || true)"
-[[ "$(grep -rl 'kc-secret' "$work/tmp" "$work/persist" 2>/dev/null | wc -l | tr -d ' ')" == 0 ]] \
+[[ "$(grep -rlD skip 'kc-secret' "$work/tmp" "$work/persist" 2>/dev/null | wc -l | tr -d ' ')" == 0 ]] \
     && t "keychain value uncached" "yes" "yes" || t "keychain value uncached" "yes" "no"
 grep -q 'MIXOP' "$work/tmp/opgate-session/test-session.mixed.v4" 2>/dev/null \
     && t "op value still cached" "yes" "yes" || t "op value still cached" "yes" "no"
@@ -597,6 +609,54 @@ empty_rc=0
 out="$(opgate empty-token /bin/sh -c 'printf child-only' 2>/dev/null)" || empty_rc=$?
 t 'empty legacy profile is rejected' 1 "$empty_rc"
 [[ -z "$out" ]] && t 'empty legacy profile keeps output clean' yes yes || t 'empty legacy profile keeps output clean' yes no
+
+# --- approval holder -------------------------------------------------------
+# Without a terminal on stdin, account-profile op calls run inside one holder
+# process per session, so the desktop app sees one terminal session across
+# tool calls. The fake logs its parent pid: same holder, same parent.
+export OP_FAKE_STDIN_LOG="$work/stdin.log"
+export OPGATE_APPROVAL_KEEPALIVE=0
+print -r -- '# opgate:account test.1password.com' > "$work/profiles/approval.env"
+print -r -- 'APPROVAL=op://vault/item/field' >> "$work/profiles/approval.env"
+# Two separate shells, as an agent harness would run them.
+zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list" </dev/null >/dev/null
+first="$(tail -1 "$OP_FAKE_STDIN_LOG")"
+zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- vault list" </dev/null >/dev/null
+second="$(tail -1 "$OP_FAKE_STDIN_LOG")"
+holder_dir="$(zsh -c "source '$root/opgate.zsh'; _opg_init; _opg_holder_dir" </dev/null)"
+holder_pid="$(<"$holder_dir/pid")"
+t 'holder is running' yes "$(kill -0 "$holder_pid" 2>/dev/null && print yes || print no)"
+t 'first no-tty call runs op in the holder' "item file: ppid=$holder_pid" "$first"
+t 'second shell reuses the same holder' "vault file: ppid=$holder_pid" "$second"
+local holder_rc=0
+zsh -c "source '$root/opgate.zsh'; OP_FAKE_ITEM_FAIL=1 opgate op --profile approval -- item get x" </dev/null >/dev/null 2>&1 || holder_rc=$?
+t 'holder relays exit status' 9 "$holder_rc"
+t 'holder relays stdout' item-ok "$(zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item get x" </dev/null 2>/dev/null)"
+print template | zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item create" >/dev/null
+t 'piped template reaches op through the holder' "item file:template ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
+out="$(print childdata | zsh -c "source '$root/opgate.zsh'; opgate session --profile approval -- /bin/sh -c 'IFS= read -r x; printf %s \"\$x\"'")"
+t 'session check runs in the holder' "vault file: ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
+t 'session child keeps its own stdin' childdata "$out"
+zsh -c "source '$root/opgate.zsh'; opgate exec --profile approval -- /usr/bin/true" </dev/null
+t 'explicit exec resolves in the holder' "run file: ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
+zsh -c "source '$root/opgate.zsh'; opgate op --profile agents -- item list" </dev/null >/dev/null
+[[ "$(tail -1 "$OP_FAKE_STDIN_LOG")" == *"ppid=$holder_pid" ]] \
+    && t 'service account never uses the holder' no yes || t 'service account never uses the holder' no no
+OPGATE_APPROVAL=call zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list" </dev/null >/dev/null
+[[ "$(tail -1 "$OP_FAKE_STDIN_LOG")" == *"ppid=$holder_pid" ]] \
+    && t 'OPGATE_APPROVAL=call runs op directly' no yes || t 'OPGATE_APPROVAL=call runs op directly' no no
+t 'ls reports the holder' "approval: holder pid $holder_pid for session ${${holder_dir:t}%.holder}" "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)"
+zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
+sleep 2   # the keeper drains the holder's pty once a second; exit completes then
+t 'flush --session stops the holder' no "$(kill -0 "$holder_pid" 2>/dev/null && print yes || print no)"
+[[ ! -e "$holder_dir" ]] && t 'flush --session removes the holder dir' yes yes || t 'flush --session removes the holder dir' yes no
+zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list" </dev/null >/dev/null
+new_pid="$(<"$holder_dir/pid")"
+[[ "$new_pid" != "$holder_pid" ]] && t 'next call starts a fresh holder' yes yes || t 'next call starts a fresh holder' yes no
+zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item edit x" </dev/null >/dev/null
+t 'a vault write keeps the holder' "$new_pid" "$(<"$holder_dir/pid")"
+zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
+unset OP_FAKE_STDIN_LOG OPGATE_APPROVAL_KEEPALIVE
 
 print
 print -r -- "passed $pass, failed $fail"

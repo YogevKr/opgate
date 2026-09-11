@@ -112,9 +112,36 @@ or when 1Password locks. Starting another terminal also requires approval.
 The wrapper does not extend these limits or use secret caches as approval.
 See [native approval rules](https://www.1password.dev/cli/app-integration-security).
 
-Explicit `exec` with an account profile also consults native authorization.
-It does not read or write the original environment caches.
-The older profile shortcuts retain their existing cache behavior.
+### One approval per agent session
+
+The desktop app ties an approval to the process session `op` runs in. For a
+human that is the terminal. An agent tool call is a fresh process session with
+no terminal, so each `op` call from an agent arrived as a new terminal and
+1Password asked for Touch ID again, for every command.
+
+Without a terminal on stdin, opgate runs account-profile `op` calls through a
+holder: one small zsh process per session, in its own process session, keyed
+like the session cache (Claude Code session, else Codex thread, else the
+terminal app). The holder runs `op` on the caller's behalf and relays stdin,
+stdout, stderr, and the exit status. Approve once, and every later
+`opgate op`, `opgate session`, `opgate exec`, or profile resolve from that
+agent session reuses the approval.
+
+- The holder exits with the session (`opgate flush --session`, the SessionEnd
+  hook) or at the 12h session TTL.
+- It sends `op whoami` every `OPGATE_APPROVAL_KEEPALIVE` seconds (default
+  480) so the approval does not idle out. `0` turns the keepalive off.
+- Service-account profiles never use it; they never prompt. A shell with a
+  terminal on stdin never uses it; that terminal is already its own session.
+- `OPGATE_APPROVAL=call` restores the bare per-call behavior.
+- `opgate ls` reports the holder state. Vault writes through `opgate op`
+  invalidate caches but keep the holder.
+
+Exposure: while the holder lives, any process running as this user that can
+write under the session directory can run `op` on the approved account
+through it. That is the class the terminal session and the session cache
+already sit in, but it is the whole account, not one scoped vault. Agents
+that only need a service account should keep using one.
 
 ## fnox backend
 
@@ -295,7 +322,9 @@ shadow an existing command. Profile names `ls`, `list`, `read`, `approve`,
 
 1Password CLI authorization lasts 10 idle minutes per terminal; agent
 harnesses run every command in a fresh shell. Uncached, that is one approval
-prompt per tool call. opgate stacks three tiers in front of `op run`:
+prompt per tool call. Two mechanisms remove it. The approval holder (above)
+makes every account `op` call from an agent session count as one terminal
+session. On top of that, opgate stacks three tiers in front of `op run`:
 
 1. **Shell memory** — non-exported assoc arrays. Children only see values for
    the lifetime of a wrapped command, same as plain `op run`.
