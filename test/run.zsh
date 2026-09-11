@@ -655,6 +655,18 @@ new_pid="$(<"$holder_dir/pid")"
 [[ "$new_pid" != "$holder_pid" ]] && t 'next call starts a fresh holder' yes yes || t 'next call starts a fresh holder' yes no
 zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item edit x" </dev/null >/dev/null
 t 'a vault write keeps the holder' "$new_pid" "$(<"$holder_dir/pid")"
+# A request that never answers is killed inside the holder after
+# OPGATE_OP_TIMEOUT, so the next request is not stuck behind it.
+local hang_rc=0 t0 t1
+OP_FAKE_HANG=8 OPGATE_OP_TIMEOUT=1 zsh -c "source '$root/opgate.zsh'; opgate exec --profile approval -- /usr/bin/true" </dev/null >/dev/null 2>&1 || hang_rc=$?
+[[ $hang_rc -ne 0 ]] && t 'hung request fails the caller' yes yes || t 'hung request fails the caller' yes no
+t0=$EPOCHSECONDS
+out="$(zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item get x" </dev/null 2>/dev/null)"
+t1=$EPOCHSECONDS
+t 'holder answers the next request' item-ok "$out"
+(( t1 - t0 < 5 )) && t 'next request is not stuck behind the hung one' yes yes || t 'next request is not stuck behind the hung one' yes "no (${$(( t1 - t0 ))}s)"
+sleep 0.3
+[[ -z "$(print -l "$holder_dir"/req-*(N))" ]] && t 'holder leaves no request behind' yes yes || t 'holder leaves no request behind' yes no
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
 unset OP_FAKE_STDIN_LOG OPGATE_APPROVAL_KEEPALIVE
 

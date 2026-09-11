@@ -80,7 +80,7 @@
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.5.0
+typeset -g OPGATE_VERSION=0.5.1
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -1145,8 +1145,11 @@ _opg_holder_close_fds() {
 # (a test suite's `rm -rf $work` on exit is the kind of thing it would run).
 _opg_holder_main() {
     emulate -L zsh
-    local dir="$1" ttl="$2" keep="$3" q id acct cwd oppath rc tick last_keep=$SECONDS
-    local -a argv accounts envs
+    setopt local_options no_monitor no_notify
+    local dir="$1" ttl="$2" keep="$3" q id acct cwd oppath tmo rc cpid waited tick
+    local start=$SECONDS   # a zpty child inherits SECONDS; measure from here
+    local -a argv envs
+    local -A last_seen     # account -> SECONDS of its last op call or keepalive
     trap - EXIT; trap '' HUP
     _opg_vals=()   # no resolved values idle in a long-lived process
     _opg_holder_close_fds
@@ -1158,31 +1161,59 @@ _opg_holder_main() {
     print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ started: ttl=${ttl}s keepalive=${keep}s"
     tick=60; (( keep > 0 && keep < tick )) && tick=$keep
     while :; do
-        (( ttl > 0 && SECONDS > ttl )) && { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session TTL reached"; break }
+        (( ttl > 0 && SECONDS - start > ttl )) && { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session TTL reached"; break }
         [[ -r "$dir/pid" && "$(<"$dir/pid")" == "$$" ]] || { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: pid file gone"; break }
+        # A caller killed mid-wait leaves its request, result included, behind.
+        rm -rf "$dir"/req-*(N/mm+10)
         id=""
         if ! read -r -t "$tick" -u $q id; then
-            if (( keep > 0 && SECONDS - last_keep >= keep )); then
-                for acct in $accounts; do OP_ACCOUNT="$acct" command op whoami >/dev/null 2>&1; done
-                last_keep=$SECONDS
+            if (( keep > 0 )); then
+                for acct in ${(k)last_seen}; do
+                    (( SECONDS - last_seen[$acct] >= keep )) || continue
+                    OP_ACCOUNT="$acct" command op whoami >/dev/null 2>&1
+                    last_seen[$acct]=$SECONDS
+                done
             fi
             continue
         fi
         [[ "$id" =~ '^[A-Za-z0-9._-]+$' && -r "$dir/req-$id/cmd" ]] || continue
-        argv=() acct="" cwd="" oppath=""
+        argv=() acct="" cwd="" oppath="" tmo=0
         source "$dir/req-$id/cmd"
-        [[ -n "$acct" ]] && (( ! ${accounts[(Ie)$acct]} )) && accounts+=("$acct")
         # op runs with the caller's environment, not the holder's: per-call
         # variables (OP_ACCOUNT, the fake's knobs in the test suite) must
-        # reach it as if the caller had run op itself.
-        envs=(${(0)"$(<"$dir/req-$id/env")"})
-        rc=0
+        # reach it as if the caller had run op itself. Exported from inside
+        # the child, never as env(1) arguments a process listing could show.
+        # XPC_* are launchd's per-process markers, and exporting one from a
+        # variable inside a forked zsh aborts the shell on macOS (zsh 5.9).
+        envs=(${${(0)"$(<"$dir/req-$id/env")"}:#XPC_*})
         ( cd -q -- "${cwd:-/}" 2>/dev/null || cd -q /
-          exec /usr/bin/env -i "${envs[@]}" "${oppath:-op}" "${argv[@]}" ) \
-            <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" || rc=$?
-        print -r -- "$rc" >| "$dir/req-$id/rc"
-        last_keep=$SECONDS
+          # op must see the caller's environment, not the holder's: the
+          # long-lived holder inherited its spawner's env, and any variable of
+          # its own would leak into every request (a preserved OP_SESSION, a
+          # test's OP_FAKE_*). Clear our exports, then apply only the caller's
+          # — the same environment op would have seen run in the caller. Values
+          # go through the environment, never argv, so no secret reaches ps.
+          local _v
+          for _v in ${(k)parameters[(R)*export*]}; do unset "$_v" 2>/dev/null; done
+          (( ${#envs} )) && export "${envs[@]}" 2>/dev/null
+          exec "${oppath:-op}" "${argv[@]}" ) <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
+        # Bounded, like _opg_capture: a request that never answers must not
+        # take every later request on this holder down with it.
+        cpid=$! waited=0
+        while kill -0 $cpid 2>/dev/null; do
+            if (( tmo > 0 && waited >= tmo * 5 )); then
+                kill -TERM $cpid 2>/dev/null; command sleep 1; kill -KILL $cpid 2>/dev/null
+                break
+            fi
+            command sleep 0.2; (( ++waited ))
+        done
+        wait $cpid 2>/dev/null; rc=$?
+        (( tmo > 0 && waited >= tmo * 5 )) && rc=124
+        # rc appears complete or not at all: the caller polls for the file.
+        print -r -- "$rc" >| "$dir/req-$id/rc.tmp" && mv -f "$dir/req-$id/rc.tmp" "$dir/req-$id/rc"
+        [[ -n "$acct" ]] && last_seen[$acct]=$SECONDS
     done
+    rm -rf "$dir"/req-*(N)
     rm -f "$dir/pid"
     exit 0
 }
@@ -1242,6 +1273,10 @@ _opg_holder_ensure() {
         rmdir "$dir/spawn.lock" 2>/dev/null   # abandoned by a spawner that died
         mkdir "$dir/spawn.lock" 2>/dev/null || return 1
     fi
+    # Another caller may have finished spawning between our check and the lock.
+    if [[ -r "$dir/pid" ]] && kill -0 "$(<"$dir/pid")" 2>/dev/null; then
+        rmdir "$dir/spawn.lock" 2>/dev/null; REPLY="$dir"; return 0
+    fi
     _opg_holder_spawn "$dir" || rc=$?
     rmdir "$dir/spawn.lock" 2>/dev/null
     (( rc == 0 )) || { print -u2 -- "opgate: could not start the approval holder; running op directly"; return 1 }
@@ -1272,6 +1307,7 @@ _opg_op_reads_stdin() {
 # Run one op command in the holder and relay its result.
 _opg_holder_call() {
     local dir="$1" id req pid fd i=0 rc=1 tmo="${OPGATE_OP_TIMEOUT:-120}"; shift
+    [[ "$tmo" == <-> ]] || tmo=120
     zmodload zsh/system 2>/dev/null || return 1
     pid="$(<"$dir/pid")" 2>/dev/null || return 1
     while :; do
@@ -1286,7 +1322,10 @@ _opg_holder_call() {
     fi
     chmod 600 "$req/in"
     ( umask 077; /usr/bin/env -0 >| "$req/env" ) || { rm -rf "$req"; return 1 }
-    print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
+    print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}} tmo=${(qq)tmo}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
+    # Killed while waiting (the resolver's watchdog does that): take the
+    # request, and the result the holder may still write into it, along.
+    trap 'rm -rf "$req"; exit 143' TERM INT HUP
     # A non-blocking open fails with ENXIO when no holder keeps the FIFO open.
     if ! sysopen -w -o nonblock -u fd "$dir/queue" 2>/dev/null; then
         rm -rf "$req"; print -u2 -- "opgate: approval holder is gone"; return 1
@@ -1302,6 +1341,7 @@ _opg_holder_call() {
     if [[ -e "$req/rc" ]]; then
         cat "$req/out"; cat "$req/err" >&2
         rc="$(<"$req/rc")"
+        [[ "$rc" == <-> ]] || rc=1
     else
         print -u2 -- "opgate: approval holder did not answer"
         rc=1
@@ -1676,6 +1716,8 @@ usage: opgate session --profile personal|work -- <command> [args...]
 Request native approval for the selected account, then start the command.
 Requires an account profile; service-account profiles cannot open account sessions.
 Native approval can expire or be revoked during the command.
+Without a terminal on stdin the approval lives in this session's holder; the
+command inherits it only for op calls it makes through opgate, not for bare op.
 Example: opgate session --profile personal -- codex
 EOF
             ;;

@@ -133,6 +133,12 @@ agent session reuses the approval.
   480) so the approval does not idle out. `0` turns the keepalive off.
 - Service-account profiles never use it; they never prompt. A shell with a
   terminal on stdin never uses it; that terminal is already its own session.
+- Without a terminal, `opgate session` approves the holder, not the child's
+  own process session. The child inherits the approval for `op` calls it
+  makes through opgate (`opgate op`, `opgate exec`, profile shortcuts). A
+  bare `op` inside the child still runs in its own session and prompts.
+- A request is bounded by `OPGATE_OP_TIMEOUT` inside the holder too, so one
+  unanswered call cannot block the calls behind it.
 - `OPGATE_APPROVAL=call` restores the bare per-call behavior.
 - `opgate ls` reports the holder state. Vault writes through `opgate op`
   invalidate caches but keep the holder.
