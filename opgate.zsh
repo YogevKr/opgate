@@ -76,11 +76,14 @@
 # and a new Touch ID prompt. Without a terminal on stdin, account-profile op
 # calls run inside one long-lived session per agent session instead (see
 # _opg_holder_main): approve once, and the rest of the session rides it.
+# The holder serves only processes that descend from the session's root
+# process (claude, codex, the terminal app) — ancestry is kernel-managed, so
+# a same-user process outside that tree is refused (_opg_in_tree).
 
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.5.1
+typeset -g OPGATE_VERSION=0.6.0
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -1117,12 +1120,68 @@ _opg_auth_run() (
 # stdin never uses it: that terminal is already its own session.
 # OPGATE_APPROVAL=call restores the bare call.
 #
-# Exposure, stated plainly: while the holder lives, any process running as
-# this user that can write under the session directory can run op on the
-# approved account through it. That is the class the terminal session and the
-# session cache already sit in, not a new one — but it is the whole account,
-# not one scoped vault, so agents that only need a service account should
-# keep using one.
+# Who may use it: only the session that approved it. At spawn the holder
+# records the session's root — the nearest non-shell ancestor of the spawner:
+# claude, codex, or the terminal app, with its start time. Each request must
+# come from a process that descends from that root. The requester proves
+# nothing itself: it keeps a claim file open, and the holder asks the kernel
+# (fuser/lsof, or /proc) which pids hold it, then walks their ancestry. A
+# process cannot choose its parent after the fact, so a same-user process
+# outside the tree — another agent, a cron job, a sandboxed job that can write
+# to $TMPDIR — is refused with status 126. OPGATE_APPROVAL_SCOPE=key restores
+# serving any caller that knows the session key (needed when several agent
+# processes deliberately share one key).
+#
+# Exposure that remains: anything inside the tree — the agent itself and every
+# child it starts — can run op on the approved account for the holder's life,
+# and root can do anything. That is the whole account, not one scoped vault,
+# so agents that only need a service account should keep using one.
+
+_opg_proc_start() {
+    local s; s="$(/bin/ps -o lstart= -p "$1" 2>/dev/null)"
+    print -r -- "${s//[^0-9]/}"
+}
+
+# REPLY: "<pid>-<start>" of the process that owns this session — the nearest
+# ancestor that is not a shell: claude, codex, or the terminal app.
+_opg_tree_root() {
+    local pid=${1:-$$} parent comm depth=0
+    while (( depth++ < 20 )); do
+        parent="$(/bin/ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')"
+        [[ -n "$parent" ]] && (( parent > 1 )) || return 1
+        comm="$(/bin/ps -o comm= -p $parent 2>/dev/null)"
+        case "${${comm##*/}#-}" in
+            zsh|bash|sh|dash|ksh|fish|login|env|script|nohup|timeout) pid=$parent ;;
+            *)  REPLY="${parent}-$(_opg_proc_start $parent)"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Does process $1 descend from root $2 ("<pid>-<start>")? The start time
+# guards against pid reuse. Ancestry is kernel-managed.
+_opg_in_tree() {
+    local pid="$1" root="$2" depth=0
+    while [[ "$pid" == <-> ]] && (( pid > 1 && depth++ < 40 )); do
+        if [[ "$pid" == "${root%%-*}" ]]; then
+            [[ "${pid}-$(_opg_proc_start $pid)" == "$root" ]]; return
+        fi
+        pid="$(/bin/ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')"
+    done
+    return 1
+}
+
+# Pids that hold file $1 open, from the kernel, not from the requester.
+_opg_file_holders() {
+    {
+        if (( ${+commands[fuser]} )); then command fuser "$1" 2>/dev/null | tr -c '0-9\n' '\n'
+        elif (( ${+commands[lsof]} )); then command lsof -t "$1" 2>/dev/null
+        elif [[ -d /proc ]]; then
+            local f t="${1:A}"
+            for f in /proc/<->/fd/*(N@); do [[ "${f:A}" == "$t" ]] && print -r -- "${${f#/proc/}%%/*}"; done
+        fi
+    } | grep -E '^[0-9]+$' | sort -u
+}
 
 _opg_holder_dir() {
     local key
@@ -1146,7 +1205,7 @@ _opg_holder_close_fds() {
 _opg_holder_main() {
     emulate -L zsh
     setopt local_options no_monitor no_notify
-    local dir="$1" ttl="$2" keep="$3" q id acct cwd oppath tmo rc cpid waited tick
+    local dir="$1" ttl="$2" keep="$3" scope="$4" root="$5" q id acct cwd oppath tmo rc cpid waited tick peer ok
     local start=$SECONDS   # a zpty child inherits SECONDS; measure from here
     local -a argv envs
     local -A last_seen     # account -> SECONDS of its last op call or keepalive
@@ -1158,7 +1217,7 @@ _opg_holder_main() {
     # wake on its own to check the TTL, the pid file, and the keepalive.
     exec {q}<>"$dir/queue" || exit 1
     print -r -- $$ >| "$dir/pid" || exit 1
-    print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ started: ttl=${ttl}s keepalive=${keep}s"
+    print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ started: ttl=${ttl}s keepalive=${keep}s scope=$scope root=${root:-none}"
     tick=60; (( keep > 0 && keep < tick )) && tick=$keep
     while :; do
         (( ttl > 0 && SECONDS - start > ttl )) && { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session TTL reached"; break }
@@ -1177,6 +1236,21 @@ _opg_holder_main() {
             continue
         fi
         [[ "$id" =~ '^[A-Za-z0-9._-]+$' && -r "$dir/req-$id/cmd" ]] || continue
+        # Only the session that approved may use the approval: some process
+        # holding the request's claim file open must descend from the root.
+        if [[ "$scope" == tree ]]; then
+            ok=0
+            for peer in $(_opg_file_holders "$dir/req-$id/claim"); do
+                _opg_in_tree "$peer" "$root" && { ok=1; break }
+            done
+            if (( ! ok )); then
+                print -r -- "$(date '+%Y-%m-%d %H:%M:%S') refused request $id: no holder of its claim descends from root ${root%%-*}"
+                : >| "$dir/req-$id/out"
+                print -r -- "opgate: refused — this request does not come from the session that holds the approval (root pid ${root%%-*}); OPGATE_APPROVAL_SCOPE=key serves any caller" >| "$dir/req-$id/err"
+                print -r -- 126 >| "$dir/req-$id/rc.tmp" && mv -f "$dir/req-$id/rc.tmp" "$dir/req-$id/rc"
+                continue
+            fi
+        fi
         argv=() acct="" cwd="" oppath="" tmo=0
         source "$dir/req-$id/cmd"
         # op runs with the caller's environment, not the holder's: per-call
@@ -1235,7 +1309,7 @@ _opg_holder_keeper() {
     # keep the spawner's terminal (or a test wrapper's pty) open for 12h.
     exec </dev/null >/dev/null 2>&1
     _opg_holder_close_fds
-    zpty -b inner "_opg_holder_main ${(q)1} ${(q)2} ${(q)3}" || exit 1
+    zpty -b inner "_opg_holder_main ${(q)1} ${(q)2} ${(q)3} ${(q)4} ${(q)5}" || exit 1
     while zpty -t inner 2>/dev/null; do
         zpty -r inner line 2>/dev/null
         command sleep 1
@@ -1249,8 +1323,18 @@ _opg_holder_spawn() {
     [[ -p "$dir/queue" ]] || mkfifo -m 600 "$dir/queue" || return 1
     : >| "$dir/log" && chmod 600 "$dir/log" || return 1
     rm -f "$dir/pid"
+    local scope="${OPGATE_APPROVAL_SCOPE:-tree}" root=""
+    [[ "$scope" == (tree|key) ]] || scope=tree
+    if [[ "$scope" == tree ]]; then
+        if _opg_tree_root; then root="$REPLY"
+        else
+            print -u2 -- "opgate: no session root above this shell; the holder will serve any caller with this key"
+            scope=key
+        fi
+    fi
+    ( umask 077; print -r -- "$scope" >| "$dir/scope"; print -r -- "$root" >| "$dir/root" )
     name="opgh$$$RANDOM"
-    zpty -b "$name" "_opg_holder_keeper ${(q)dir} ${_opg_session_ttl:-43200} ${OPGATE_APPROVAL_KEEPALIVE:-480}" || return 1
+    zpty -b "$name" "_opg_holder_keeper ${(q)dir} ${_opg_session_ttl:-43200} ${OPGATE_APPROVAL_KEEPALIVE:-480} ${(q)scope} ${(q)root}" || return 1
     while [[ ! -s "$dir/pid" ]] && (( i++ < 100 )); do sleep 0.05; done
     # The keeper ignores HUP; closing its master leaves both layers running.
     zpty -d "$name" 2>/dev/null
@@ -1306,7 +1390,7 @@ _opg_op_reads_stdin() {
 
 # Run one op command in the holder and relay its result.
 _opg_holder_call() {
-    local dir="$1" id req pid fd i=0 rc=1 tmo="${OPGATE_OP_TIMEOUT:-120}"; shift
+    local dir="$1" id req pid fd cfd i=0 rc=1 tmo="${OPGATE_OP_TIMEOUT:-120}"; shift
     [[ "$tmo" == <-> ]] || tmo=120
     zmodload zsh/system 2>/dev/null || return 1
     pid="$(<"$dir/pid")" 2>/dev/null || return 1
@@ -1321,14 +1405,17 @@ _opg_holder_call() {
         : >| "$req/in"
     fi
     chmod 600 "$req/in"
-    ( umask 077; /usr/bin/env -0 >| "$req/env" ) || { rm -rf "$req"; return 1 }
+    # Held open until the answer arrives: the holder asks the kernel who holds
+    # it and checks that process descends from the session root.
+    exec {cfd}>>"$req/claim" || { rm -rf "$req"; return 1 }
+    ( umask 077; /usr/bin/env -0 >| "$req/env" ) || { exec {cfd}>&-; rm -rf "$req"; return 1 }
     print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}} tmo=${(qq)tmo}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
     # Killed while waiting (the resolver's watchdog does that): take the
     # request, and the result the holder may still write into it, along.
     trap 'rm -rf "$req"; exit 143' TERM INT HUP
     # A non-blocking open fails with ENXIO when no holder keeps the FIFO open.
     if ! sysopen -w -o nonblock -u fd "$dir/queue" 2>/dev/null; then
-        rm -rf "$req"; print -u2 -- "opgate: approval holder is gone"; return 1
+        exec {cfd}>&-; rm -rf "$req"; print -u2 -- "opgate: approval holder is gone"; return 1
     fi
     print -u $fd -r -- "$id"
     exec {fd}>&-
@@ -1346,6 +1433,7 @@ _opg_holder_call() {
         print -u2 -- "opgate: approval holder did not answer"
         rc=1
     fi
+    exec {cfd}>&-
     rm -rf "$req"
     return $rc
 }
@@ -1369,7 +1457,12 @@ _opg_approval_line() {
     elif ! dir="$(_opg_holder_dir)"; then
         print -r -- "approval: per op call (no session key)"
     elif [[ -r "$dir/pid" ]] && pid="$(<"$dir/pid")" && kill -0 "$pid" 2>/dev/null; then
-        print -r -- "approval: holder pid $pid for session ${${dir:t}%.holder}"
+        local scope root; scope="$(<"$dir/scope" 2>/dev/null)"; root="$(<"$dir/root" 2>/dev/null)"
+        if [[ "$scope" == tree && -n "$root" ]]; then
+            print -r -- "approval: holder pid $pid for session ${${dir:t}%.holder}, serving the process tree under pid ${root%%-*} ($(/bin/ps -o comm= -p ${root%%-*} 2>/dev/null | sed 's#.*/##'))"
+        else
+            print -r -- "approval: holder pid $pid for session ${${dir:t}%.holder}, serving any caller with this key"
+        fi
     else
         print -r -- "approval: holder starts on the first account call (session ${${dir:t}%.holder})"
     fi

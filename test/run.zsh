@@ -645,7 +645,7 @@ zsh -c "source '$root/opgate.zsh'; opgate op --profile agents -- item list" </de
 OPGATE_APPROVAL=call zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list" </dev/null >/dev/null
 [[ "$(tail -1 "$OP_FAKE_STDIN_LOG")" == *"ppid=$holder_pid" ]] \
     && t 'OPGATE_APPROVAL=call runs op directly' no yes || t 'OPGATE_APPROVAL=call runs op directly' no no
-t 'ls reports the holder' "approval: holder pid $holder_pid for session ${${holder_dir:t}%.holder}" "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)"
+t 'ls reports the holder' "approval: holder pid $holder_pid for session ${${holder_dir:t}%.holder}" "${$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)%%, serving*}"
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
 sleep 2   # the keeper drains the holder's pty once a second; exit completes then
 t 'flush --session stops the holder' no "$(kill -0 "$holder_pid" 2>/dev/null && print yes || print no)"
@@ -667,6 +667,33 @@ t 'holder answers the next request' item-ok "$out"
 (( t1 - t0 < 5 )) && t 'next request is not stuck behind the hung one' yes yes || t 'next request is not stuck behind the hung one' yes "no (${$(( t1 - t0 ))}s)"
 sleep 0.3
 [[ -z "$(print -l "$holder_dir"/req-*(N))" ]] && t 'holder leaves no request behind' yes yes || t 'holder leaves no request behind' yes no
+# Only the session's process tree may use the approval. The suite's callers
+# descend from the same root as the spawner; a double-forked orphan does not.
+holder_dir="$(zsh -c "source '$root/opgate.zsh'; _opg_init; _opg_holder_dir" </dev/null)"
+t 'holder records a tree scope' tree "$(<"$holder_dir/scope")"
+[[ "$(<"$holder_dir/root")" == <->-<-> ]] && t 'holder records its root pid and start' yes yes || t 'holder records its root pid and start' yes "no ($(<"$holder_dir/root"))"
+orphan_out="$work/orphan.out"; rm -f "$orphan_out"
+( zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list; print -r -- rc=\$?" </dev/null >"$orphan_out" 2>&1 & )
+local i=0; while ! grep -q '^rc=' "$orphan_out" 2>/dev/null && (( i++ < 80 )); do sleep 0.25; done
+t 'orphaned caller is refused' 'rc=126' "$(grep '^rc=' "$orphan_out")"
+[[ "$(<"$orphan_out")" == *"does not come from the session"* ]] && t 'refusal names the cause' yes yes || t 'refusal names the cause' yes no
+before_ops="$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+# A hand-made request that nobody holds open is refused without running op.
+req="$holder_dir/req-forged1"; mkdir -m 700 "$req"; : > "$req/claim"; : > "$req/in"; /usr/bin/env -0 > "$req/env"
+print -r -- "argv=( 'item' 'list' ) acct='test.1password.com' cwd='/' oppath='op' tmo='10'" > "$req/cmd"
+zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- forged1' -- "$holder_dir/queue"
+i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
+t 'unheld forged request is refused' 126 "$(<"$req/rc" 2>/dev/null)"
+t 'refused request never reaches op' "$before_ops" "$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
+rm -rf "$req"
+t 'ls names the tree root' yes "$([[ "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)" == *"serving the process tree under pid"* ]] && print yes || print no)"
+# scope=key serves any caller that knows the key, orphans included.
+zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
+rm -f "$orphan_out"
+( OPGATE_APPROVAL_SCOPE=key zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list; print -r -- rc=\$?" </dev/null >"$orphan_out" 2>&1 & )
+i=0; while ! grep -q '^rc=' "$orphan_out" 2>/dev/null && (( i++ < 80 )); do sleep 0.25; done
+t 'OPGATE_APPROVAL_SCOPE=key serves an orphan' 'rc=0' "$(grep '^rc=' "$orphan_out")"
+t 'key scope is recorded' key "$(<"$holder_dir/scope")"
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
 unset OP_FAKE_STDIN_LOG OPGATE_APPROVAL_KEEPALIVE
 

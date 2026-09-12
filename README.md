@@ -143,11 +143,25 @@ agent session reuses the approval.
 - `opgate ls` reports the holder state. Vault writes through `opgate op`
   invalidate caches but keep the holder.
 
-Exposure: while the holder lives, any process running as this user that can
-write under the session directory can run `op` on the approved account
-through it. That is the class the terminal session and the session cache
-already sit in, but it is the whole account, not one scoped vault. Agents
-that only need a service account should keep using one.
+Who may use it: only the session that approved it. At spawn the holder
+records the session's root process, the nearest non-shell ancestor of the
+spawner: `claude`, `codex`, or the terminal app. Each request must come from a
+process that descends from that root. The requester proves nothing itself: it
+keeps a claim file open, and the holder asks the kernel which processes hold
+it (`fuser`, `lsof`, or `/proc`), then walks their ancestry. A process cannot
+choose its parent after the fact, so a same-user process outside the tree,
+another agent, a cron job, or a sandboxed job that can write to `$TMPDIR`, is
+refused with status 126 and a clear error.
+
+`OPGATE_APPROVAL_SCOPE=key` restores serving any caller that knows the session
+key. Use it when several agent processes deliberately share one
+`OPGATE_SESSION_KEY`; under the default `tree` scope they would not share a
+root. `opgate ls` names the root the holder serves.
+
+Exposure that remains: anything inside the tree, the agent itself and every
+child it starts, can run `op` on the approved account for the holder's life,
+and root can do anything. That is the whole account, not one scoped vault.
+Agents that only need a service account should keep using one.
 
 ## fnox backend
 
