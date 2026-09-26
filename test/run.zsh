@@ -717,6 +717,18 @@ t 'request text never executes' absent "$([[ -e "$work/request-code-ran" ]] && p
 exec {claimfd}>&-
 rm -rf "$req"
 
+# export must not evaluate an array subscript supplied as an environment name.
+req="$holder_dir/req-envcode"; mkdir -m 700 "$req"; : > "$req/in"
+exec {claimfd}>>"$req/claim"
+printf '%s\0' test.1password.com / 10 item list > "$req/cmd"
+printf '%s\0' "OP_TRAP[\$(touch ${(q)work}/request-env-ran)]=x" "OP_FAKE_LOG=$OP_FAKE_LOG" > "$req/env"
+zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- envcode' -- "$holder_dir/queue"
+i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
+t 'holder ignores invalid environment names' 0 "$(<"$req/rc" 2>/dev/null)"
+t 'environment names never execute' absent "$([[ -e "$work/request-env-ran" ]] && print present || print absent)"
+exec {claimfd}>&-
+rm -rf "$req"
+
 # Inert parsing preserves empty arguments, whitespace, newlines and shell text.
 local acct cwd tmo
 local -a request_argv

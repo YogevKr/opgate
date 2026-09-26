@@ -1224,6 +1224,8 @@ _opg_file_holders() {
 }
 
 _opg_holder_env_allowed() {
+    # export evaluates array subscripts; only plain environment names are data.
+    [[ "$1" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]] || return 1
     case "$1" in
         OP_*|PATH|HOME|TMPDIR|TMP|USER|LOGNAME|SHELL|LANG|LC_*|XDG_CONFIG_HOME|XDG_CACHE_HOME|XDG_DATA_HOME|XDG_RUNTIME_DIR|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR) return 0 ;;
         *) return 1 ;;
