@@ -83,7 +83,7 @@
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.6.1
+typeset -g OPGATE_VERSION=0.6.2
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -1140,7 +1140,7 @@ _opg_auth_run() (
 # The holder repeats this check because a request file can change inside the
 # approved tree. Keep the rule in one function for both paths.
 _opg_validate_native_args() {
-    local arg envfile
+    local arg envfile profile
     typeset -g REPLY=0
     (( $# )) || { print -u2 -- "usage: opgate op --profile <name> -- <op arguments>"; return 2 }
     for arg in "$@"; do
@@ -1156,7 +1156,11 @@ _opg_validate_native_args() {
                 print -u2 -- "opgate: holder rejected this run operation"; return 2
             }
             envfile="${3#--env-file=}"
-            [[ -r "$envfile" && "$envfile" == "$_opg_dir/"*.env ]] || {
+            profile="${${envfile:t}%.env}"
+            # Require a direct profile file, not traversal or a symlink target.
+            [[ "$profile" =~ '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' &&
+               "$envfile" == "$_opg_dir/$profile.env" && -r "$envfile" && ! -L "$envfile" &&
+               "${envfile:A:h}" == "${_opg_dir:A}" ]] || {
                 print -u2 -- "opgate: holder rejected this environment file"; return 2
             }
             ;;
@@ -1237,7 +1241,19 @@ _opg_holder_write_env() {
 _opg_holder_dir() {
     local key
     key="$(_opg_session_key_raw)" || return 1
-    print -r -- "$_opg_session_dir/${key}.holder"
+    print -r -- "$_opg_session_dir/${key}.v2.holder"
+}
+
+# Inert NUL-delimited fields: account, cwd, timeout, then argv. No shell code.
+# Assign the holder's dynamically scoped request variables only after parsing.
+_opg_holder_read_request() {
+    local field=""
+    local -a fields=()
+    while IFS= read -r -d $'\0' field; do fields+=("$field"); done < "$1"
+    [[ -z "$field" && ${#fields} -ge 4 ]] || return 2
+    [[ "${fields[3]}" == <-> && ${#fields[3]} -le 5 ]] || return 2
+    acct="${fields[1]}" cwd="${fields[2]}" tmo="${fields[3]}"
+    request_argv=("${fields[@]:3}")
 }
 
 # Both layers are forks of the caller and inherit every open descriptor,
@@ -1256,9 +1272,10 @@ _opg_holder_close_fds() {
 _opg_holder_main() {
     emulate -L zsh
     setopt local_options no_monitor no_notify
-    local dir="$1" ttl="$2" keep="$3" scope="$4" root="$5" q id acct cwd oppath tmo rc cpid waited tick peer ok msg _e _relay_name
+    local dir="$1" ttl="$2" keep="$3" scope="$4" root="$5" q id acct cwd tmo rc cpid waited tick peer ok msg _e _relay_name
+    local oppath="${commands[op]:A}"  # fixed at spawn, never supplied by a request
     local start=$SECONDS   # a zpty child inherits SECONDS; measure from here
-    local -a argv envs filtered_envs
+    local -a request_argv envs filtered_envs
     local -A last_seen     # account -> SECONDS of its last op call or keepalive
     trap - EXIT; trap '' HUP
     _opg_vals=()   # no resolved values idle in a long-lived process
@@ -1284,7 +1301,7 @@ _opg_holder_main() {
             if (( keep > 0 )); then
                 for acct in ${(k)last_seen}; do
                     (( SECONDS - last_seen[$acct] >= keep )) || continue
-                    OP_ACCOUNT="$acct" command op whoami >/dev/null 2>&1
+                    OP_ACCOUNT="$acct" "$oppath" whoami >/dev/null 2>&1
                     last_seen[$acct]=$SECONDS
                 done
             fi
@@ -1306,9 +1323,9 @@ _opg_holder_main() {
                 continue
             fi
         fi
-        argv=() acct="" cwd="" oppath="" tmo=0
-        source "$dir/req-$id/cmd"
-        if ! msg="$(_opg_validate_native_args "${argv[@]}" 2>&1)"; then
+        request_argv=() acct="" cwd="" tmo=0 msg="invalid request data"
+        if ! _opg_holder_read_request "$dir/req-$id/cmd" ||
+           ! msg="$(_opg_validate_native_args "${request_argv[@]}" 2>&1)"; then
             : >| "$dir/req-$id/out"
             print -r -- "opgate: holder rejected the operation${msg:+: ${msg#opgate: }}" >| "$dir/req-$id/err"
             print -r -- 2 >| "$dir/req-$id/rc.tmp" && mv -f "$dir/req-$id/rc.tmp" "$dir/req-$id/rc"
@@ -1336,7 +1353,7 @@ _opg_holder_main() {
           local _clear_name
           for _clear_name in ${(k)parameters[(R)*export*]}; do unset "$_clear_name" 2>/dev/null; done
           (( ${#filtered_envs} )) && export "${filtered_envs[@]}" 2>/dev/null
-          exec "${oppath:-op}" "${argv[@]}" ) <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
+          exec "$oppath" "${request_argv[@]}" ) <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
         # Bounded, like _opg_capture: a request that never answers must not
         # take every later request on this holder down with it.
         cpid=$! waited=0
@@ -1475,7 +1492,7 @@ _opg_holder_call() {
     # it and checks that process descends from the session root.
     exec {cfd}>>"$req/claim" || { rm -rf "$req"; return 1 }
     ( umask 077; _opg_holder_write_env >| "$req/env" ) || { exec {cfd}>&-; rm -rf "$req"; return 1 }
-    print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}} tmo=${(qq)tmo}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
+    ( umask 077; printf '%s\0' "${OP_ACCOUNT:-}" "$PWD" "$tmo" "$@" >| "$req/cmd" ) || { exec {cfd}>&-; rm -rf "$req"; return 1 }
     # Killed while waiting (the resolver's watchdog does that): take the
     # request, and the result the holder may still write into it, along.
     trap 'rm -rf "$req"; exit 143' TERM INT HUP
@@ -1553,6 +1570,8 @@ _opg_native() {
     env_file="$REPLY"
     auth="$(_opg_auth "$env_file")" || return 1
     (( $# )) || { print -u2 -- "usage: opgate op --profile <name> -- <op arguments>"; return 2 }
+    # The run shape belongs only to our internal environment resolver.
+    [[ "$1" != run ]] || { print -u2 -- "opgate: use exec --profile for environment resolution"; return 2 }
     _opg_validate_native_args "$@" || return $?
     case "$1 ${2:-}" in
         'account list'|'account ls')

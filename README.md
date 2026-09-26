@@ -146,6 +146,12 @@ agent session reuses the approval.
 - The holder checks every request against the same operation allowlist as
   `opgate op`. It relays only `OP_*`, path, locale, proxy, and standard
   runtime variables. Other caller variables stay out of request files.
+- Requests contain NUL-delimited data, never shell code. The holder fixes the
+  `op` executable at startup. Resolver requests require a direct profile file;
+  traversal paths and symlink profiles are rejected.
+- Version 0.6.2 uses a separate holder protocol directory. Existing holders
+  remain with their original session until it ends. Start a new session after
+  upgrading to use the corrected protocol; native approval may be required.
 
 Who may use it: only the session that approved it. At spawn the holder
 records the session's root process, the nearest non-shell ancestor of the

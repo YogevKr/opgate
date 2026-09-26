@@ -691,7 +691,7 @@ t 'orphaned caller is refused' 'rc=126' "$(grep '^rc=' "$orphan_out")"
 before_ops="$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
 # A hand-made request that nobody holds open is refused without running op.
 req="$holder_dir/req-forged1"; mkdir -m 700 "$req"; : > "$req/claim"; : > "$req/in"; /usr/bin/env -0 > "$req/env"
-print -r -- "argv=( 'item' 'list' ) acct='test.1password.com' cwd='/' oppath='op' tmo='10'" > "$req/cmd"
+printf '%s\0' test.1password.com / 10 item list > "$req/cmd"
 zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- forged1' -- "$holder_dir/queue"
 i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
 t 'unheld forged request is refused' 126 "$(<"$req/rc" 2>/dev/null)"
@@ -700,12 +700,61 @@ rm -rf "$req"
 # A request from the approved tree still cannot widen the holder's operation set.
 req="$holder_dir/req-forged2"; mkdir -m 700 "$req"; : > "$req/claim"; : > "$req/in"; /usr/bin/env -0 > "$req/env"
 exec {claimfd}>>"$req/claim"
-print -r -- "argv=( 'config' 'get' 'x' ) acct='test.1password.com' cwd='/' oppath='op' tmo='10'" > "$req/cmd"
+printf '%s\0' test.1password.com / 10 config get x > "$req/cmd"
 zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- forged2' -- "$holder_dir/queue"
 i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
 t 'holder allowlist rejects forged operation' 2 "$(<"$req/rc" 2>/dev/null)"
 exec {claimfd}>&-
 rm -rf "$req"
+# Executable text must never run, even with a live claim from the approved tree.
+req="$holder_dir/req-code"; mkdir -m 700 "$req"; : > "$req/in"; : > "$req/env"
+exec {claimfd}>>"$req/claim"
+print -r -- "touch ${(q)work}/request-code-ran; argv=( item list ); tmo=10" > "$req/cmd"
+zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- code' -- "$holder_dir/queue"
+i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
+t 'holder rejects executable request text' 2 "$(<"$req/rc" 2>/dev/null)"
+t 'request text never executes' absent "$([[ -e "$work/request-code-ran" ]] && print present || print absent)"
+exec {claimfd}>&-
+rm -rf "$req"
+
+# Inert parsing preserves empty arguments, whitespace, newlines and shell text.
+local acct cwd tmo
+local -a request_argv
+printf '%s\0' '' "$work" 10 item get '' $'space and\nnewline' '$(touch ignored)' > "$work/request-data"
+_opg_holder_read_request "$work/request-data"
+t 'request parser preserves empty account' '' "$acct"
+t 'request parser preserves argument count' 5 "${#request_argv}"
+t 'request parser preserves empty argument' '' "${request_argv[3]}"
+t 'request parser preserves whitespace' $'space and\nnewline' "${request_argv[4]}"
+t 'request parser preserves shell text' '$(touch ignored)' "${request_argv[5]}"
+printf '%s\0' '' / '1+1' item list > "$work/request-data"
+_opg_holder_read_request "$work/request-data" && t 'request rejects nonnumeric timeout' yes no || t 'request rejects nonnumeric timeout' yes yes
+printf '%s\0' '' / 10 item > "$work/request-data"
+printf '%s' list >> "$work/request-data"
+_opg_holder_read_request "$work/request-data" && t 'request rejects unterminated field' yes no || t 'request rejects unterminated field' yes yes
+
+holder_rc=0
+opgate op --profile approval -- run --no-masking --env-file="$work/profiles/approval.env" -- /usr/bin/env -0 >/dev/null 2>&1 || holder_rc=$?
+t 'native interface rejects internal resolver command' 2 "$holder_rc"
+
+# The resolver accepts normal profiles, but refuses traversal and symlinks.
+print -r -- 'OUTSIDE=op://vault/item/field' > "$work/outside.env"
+ln -s "$work/outside.env" "$work/profiles/linked.env"
+for envpath in "$work/profiles/../outside.env" "$work/profiles/linked.env"; do
+    holder_rc=0
+    _opg_holder_call "$holder_dir" run --no-masking --env-file="$envpath" -- /usr/bin/env -0 >/dev/null 2>&1 || holder_rc=$?
+    t "holder rejects unsafe profile ${envpath:t}" 2 "$holder_rc"
+done
+holder_rc=0
+_opg_holder_call "$holder_dir" run --no-masking --env-file="$work/profiles/approval.env" -- /usr/bin/env -0 >/dev/null 2>&1 || holder_rc=$?
+t 'holder permits direct profile resolution' 0 "$holder_rc"
+
+# A later caller cannot replace the executable by changing its PATH.
+mkdir "$work/alternate-bin"
+printf '#!/bin/zsh\ntouch %q\n' "$work/replaced-op-ran" > "$work/alternate-bin/op"
+chmod +x "$work/alternate-bin/op"
+PATH="$work/alternate-bin:$PATH" _opg_holder_call "$holder_dir" item list >/dev/null
+t 'holder pins op at startup' absent "$([[ -e "$work/replaced-op-ran" ]] && print present || print absent)"
 t 'ls names the tree root' yes "$([[ "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)" == *"serving the process tree under pid"* ]] && print yes || print no)"
 # scope=key serves any caller that knows the key, orphans included.
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
