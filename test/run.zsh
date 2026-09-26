@@ -654,8 +654,17 @@ OPGATE_APPROVAL=call zsh -c "source '$root/opgate.zsh'; opgate op --profile appr
 [[ "$(tail -1 "$OP_FAKE_STDIN_LOG")" == *"ppid=$holder_pid" ]] \
     && t 'OPGATE_APPROVAL=call runs op directly' no yes || t 'OPGATE_APPROVAL=call runs op directly' no no
 t 'ls reports the holder' "approval: holder pid $holder_pid for session ${${holder_dir:t}%.holder}" "${$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)%%, serving*}"
+# An upgrade must also revoke a holder from the executable-request protocol.
+local legacy_dir="${holder_dir%.v2.holder}.holder" legacy_pid
+mkdir -m 700 "$legacy_dir"
+sleep 600 &
+legacy_pid=$!
+print -r -- "$legacy_pid" > "$legacy_dir/pid"
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
 sleep 2   # the keeper drains the holder's pty once a second; exit completes then
+t 'flush --session stops the pre-upgrade holder' no "$(kill -0 "$legacy_pid" 2>/dev/null && print yes || print no)"
+t 'flush removes the pre-upgrade holder directory' absent "$([[ -d "$legacy_dir" ]] && print present || print absent)"
+wait "$legacy_pid" 2>/dev/null || true
 t 'flush --session stops the holder' no "$(kill -0 "$holder_pid" 2>/dev/null && print yes || print no)"
 [[ ! -e "$holder_dir" ]] && t 'flush --session removes the holder dir' yes yes || t 'flush --session removes the holder dir' yes no
 zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list" </dev/null >/dev/null

@@ -150,8 +150,9 @@ agent session reuses the approval.
   `op` executable at startup. Resolver requests require a direct profile file;
   traversal paths and symlink profiles are rejected.
 - Version 0.6.2 uses a separate holder protocol directory. Existing holders
-  remain with their original session until it ends. Start a new session after
-  upgrading to use the corrected protocol; native approval may be required.
+  remain with their original session until it ends. After upgrading, run
+  `opgate flush --session` to stop both old and new holders for that session.
+  The next account call uses the corrected protocol and may require approval.
 
 Who may use it: only the session that approved it. At spawn the holder
 records the session's root process, the nearest non-shell ancestor of the

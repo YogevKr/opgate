@@ -1455,12 +1455,16 @@ _opg_holder_ensure() {
 _opg_holder_stop() {
     local dir pid
     dir="$(_opg_holder_dir)" || return 0
-    [[ -d "$dir" ]] || return 0
-    if [[ -r "$dir/pid" ]]; then
-        pid="$(<"$dir/pid")"
-        [[ "$pid" == <-> ]] && kill -TERM "$pid" 2>/dev/null
-    fi
-    rm -rf "$dir"
+    # Revoke holders from both protocols when upgrading a live session.
+    local current="$dir"
+    for dir in "$current" "${current%.v2.holder}.holder"; do
+        [[ -d "$dir" ]] || continue
+        if [[ -r "$dir/pid" ]]; then
+            pid="$(<"$dir/pid")"
+            [[ "$pid" == <-> ]] && kill -TERM "$pid" 2>/dev/null
+        fi
+        rm -rf "$dir"
+    done
 }
 
 # op takes a template or file on stdin for these; the holder must relay it.
