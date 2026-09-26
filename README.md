@@ -129,6 +129,7 @@ agent session reuses the approval.
 
 - The holder exits with the session (`opgate flush --session`, the SessionEnd
   hook) or at the 12h session TTL.
+- A tree-scoped holder also exits when its recorded session root ends.
 - It sends `op whoami` every `OPGATE_APPROVAL_KEEPALIVE` seconds (default
   480) so the approval does not idle out. `0` turns the keepalive off.
 - Service-account profiles never use it; they never prompt. A shell with a
@@ -142,6 +143,16 @@ agent session reuses the approval.
 - `OPGATE_APPROVAL=call` restores the bare per-call behavior.
 - `opgate ls` reports the holder state. Vault writes through `opgate op`
   invalidate caches but keep the holder.
+- The holder checks every request against the same operation allowlist as
+  `opgate op`. It relays only `OP_*`, path, locale, proxy, and standard
+  runtime variables. Other caller variables stay out of request files.
+- Requests contain NUL-delimited data, never shell code. The holder fixes the
+  `op` executable at startup. Resolver requests require a direct profile file;
+  traversal paths and symlink profiles are rejected.
+- Version 0.6.2 uses a separate holder protocol directory. Existing holders
+  remain with their original session until it ends. After upgrading, run
+  `opgate flush --session` to stop both old and new holders for that session.
+  The next account call uses the corrected protocol and may require approval.
 
 Who may use it: only the session that approved it. At spawn the holder
 records the session's root process, the nearest non-shell ancestor of the
@@ -159,9 +170,9 @@ key. Use it when several agent processes deliberately share one
 root. `opgate ls` names the root the holder serves.
 
 Exposure that remains: anything inside the tree, the agent itself and every
-child it starts, can run `op` on the approved account for the holder's life,
-and root can do anything. That is the whole account, not one scoped vault.
-Agents that only need a service account should keep using one.
+child it starts, can run allowed `op` operations on the approved account for
+the holder's life. That is the whole account, not one scoped vault. Agents
+that only need a service account should keep using one.
 
 ## fnox backend
 
