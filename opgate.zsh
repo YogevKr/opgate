@@ -83,7 +83,7 @@
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.6.0
+typeset -g OPGATE_VERSION=0.6.1
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -1137,6 +1137,36 @@ _opg_auth_run() (
 # and root can do anything. That is the whole account, not one scoped vault,
 # so agents that only need a service account should keep using one.
 
+# The holder repeats this check because a request file can change inside the
+# approved tree. Keep the rule in one function for both paths.
+_opg_validate_native_args() {
+    local arg envfile
+    typeset -g REPLY=0
+    (( $# )) || { print -u2 -- "usage: opgate op --profile <name> -- <op arguments>"; return 2 }
+    for arg in "$@"; do
+        case "$arg" in
+            --account|--account=*|--session|--session=*)
+                print -u2 -- "opgate: select the account with --profile"; return 2 ;;
+        esac
+    done
+    case "$1 ${2:-}" in
+        'account list'|'account ls'|'item get'|'item list'|'vault get'|'vault list'|'document get'|'document list'|'read '*|'whoami '*) ;;
+        'run --no-masking')
+            (( $# == 6 )) && [[ "$2" == --no-masking && "$3" == --env-file=* && "$4" == -- && "$5" == /usr/bin/env && "$6" == -0 ]] || {
+                print -u2 -- "opgate: holder rejected this run operation"; return 2
+            }
+            envfile="${3#--env-file=}"
+            [[ -r "$envfile" && "$envfile" == "$_opg_dir/"*.env ]] || {
+                print -u2 -- "opgate: holder rejected this environment file"; return 2
+            }
+            ;;
+        'item create'|'item edit'|'item delete'|'item archive'|'item move'|'item copy'|'document create'|'document edit'|'document delete')
+            REPLY=1 ;;
+        *) print -u2 -- "opgate: supported operations are item/document reads and writes, vault reads, read, whoami, and account list"; return 2 ;;
+    esac
+    return 0
+}
+
 _opg_proc_start() {
     local s; s="$(/bin/ps -o lstart= -p "$1" 2>/dev/null)"
     print -r -- "${s//[^0-9]/}"
@@ -1171,6 +1201,12 @@ _opg_in_tree() {
     return 1
 }
 
+_opg_root_alive() {
+    local root="$1" pid="${1%%-*}"
+    [[ "$pid" == <-> && "$pid" -gt 1 ]] || return 1
+    [[ "${pid}-$(_opg_proc_start "$pid")" == "$root" ]]
+}
+
 # Pids that hold file $1 open, from the kernel, not from the requester.
 _opg_file_holders() {
     {
@@ -1181,6 +1217,21 @@ _opg_file_holders() {
             for f in /proc/<->/fd/*(N@); do [[ "${f:A}" == "$t" ]] && print -r -- "${${f#/proc/}%%/*}"; done
         fi
     } | grep -E '^[0-9]+$' | sort -u
+}
+
+_opg_holder_env_allowed() {
+    case "$1" in
+        OP_*|PATH|HOME|TMPDIR|TMP|USER|LOGNAME|SHELL|LANG|LC_*|XDG_CONFIG_HOME|XDG_CACHE_HOME|XDG_DATA_HOME|XDG_RUNTIME_DIR|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_opg_holder_write_env() {
+    local name
+    for name in ${(k)parameters[(R)*export*]}; do
+        _opg_holder_env_allowed "$name" || continue
+        print -rn -- "$name=${(P)name}"$'\0'
+    done
 }
 
 _opg_holder_dir() {
@@ -1205,9 +1256,9 @@ _opg_holder_close_fds() {
 _opg_holder_main() {
     emulate -L zsh
     setopt local_options no_monitor no_notify
-    local dir="$1" ttl="$2" keep="$3" scope="$4" root="$5" q id acct cwd oppath tmo rc cpid waited tick peer ok
+    local dir="$1" ttl="$2" keep="$3" scope="$4" root="$5" q id acct cwd oppath tmo rc cpid waited tick peer ok msg _e _relay_name
     local start=$SECONDS   # a zpty child inherits SECONDS; measure from here
-    local -a argv envs
+    local -a argv envs filtered_envs
     local -A last_seen     # account -> SECONDS of its last op call or keepalive
     trap - EXIT; trap '' HUP
     _opg_vals=()   # no resolved values idle in a long-lived process
@@ -1221,6 +1272,10 @@ _opg_holder_main() {
     tick=60; (( keep > 0 && keep < tick )) && tick=$keep
     while :; do
         (( ttl > 0 && SECONDS - start > ttl )) && { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session TTL reached"; break }
+        if [[ "$scope" == tree && -n "$root" ]] && ! _opg_root_alive "$root"; then
+            print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: session root ended"
+            break
+        fi
         [[ -r "$dir/pid" && "$(<"$dir/pid")" == "$$" ]] || { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') holder $$ exit: pid file gone"; break }
         # A caller killed mid-wait leaves its request, result included, behind.
         rm -rf "$dir"/req-*(N/mm+10)
@@ -1253,6 +1308,12 @@ _opg_holder_main() {
         fi
         argv=() acct="" cwd="" oppath="" tmo=0
         source "$dir/req-$id/cmd"
+        if ! msg="$(_opg_validate_native_args "${argv[@]}" 2>&1)"; then
+            : >| "$dir/req-$id/out"
+            print -r -- "opgate: holder rejected the operation${msg:+: ${msg#opgate: }}" >| "$dir/req-$id/err"
+            print -r -- 2 >| "$dir/req-$id/rc.tmp" && mv -f "$dir/req-$id/rc.tmp" "$dir/req-$id/rc"
+            continue
+        fi
         # op runs with the caller's environment, not the holder's: per-call
         # variables (OP_ACCOUNT, the fake's knobs in the test suite) must
         # reach it as if the caller had run op itself. Exported from inside
@@ -1260,6 +1321,11 @@ _opg_holder_main() {
         # XPC_* are launchd's per-process markers, and exporting one from a
         # variable inside a forked zsh aborts the shell on macOS (zsh 5.9).
         envs=(${${(0)"$(<"$dir/req-$id/env")"}:#XPC_*})
+        filtered_envs=()
+        for _e in "${envs[@]}"; do
+            _relay_name="${_e%%=*}"
+            _opg_holder_env_allowed "$_relay_name" && filtered_envs+=("$_e")
+        done
         ( cd -q -- "${cwd:-/}" 2>/dev/null || cd -q /
           # op must see the caller's environment, not the holder's: the
           # long-lived holder inherited its spawner's env, and any variable of
@@ -1267,9 +1333,9 @@ _opg_holder_main() {
           # test's OP_FAKE_*). Clear our exports, then apply only the caller's
           # — the same environment op would have seen run in the caller. Values
           # go through the environment, never argv, so no secret reaches ps.
-          local _v
-          for _v in ${(k)parameters[(R)*export*]}; do unset "$_v" 2>/dev/null; done
-          (( ${#envs} )) && export "${envs[@]}" 2>/dev/null
+          local _clear_name
+          for _clear_name in ${(k)parameters[(R)*export*]}; do unset "$_clear_name" 2>/dev/null; done
+          (( ${#filtered_envs} )) && export "${filtered_envs[@]}" 2>/dev/null
           exec "${oppath:-op}" "${argv[@]}" ) <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
         # Bounded, like _opg_capture: a request that never answers must not
         # take every later request on this holder down with it.
@@ -1408,7 +1474,7 @@ _opg_holder_call() {
     # Held open until the answer arrives: the holder asks the kernel who holds
     # it and checks that process descends from the session root.
     exec {cfd}>>"$req/claim" || { rm -rf "$req"; return 1 }
-    ( umask 077; /usr/bin/env -0 >| "$req/env" ) || { exec {cfd}>&-; rm -rf "$req"; return 1 }
+    ( umask 077; _opg_holder_write_env >| "$req/env" ) || { exec {cfd}>&-; rm -rf "$req"; return 1 }
     print -r -- "argv=( ${(qq)@} ) acct=${(qq)${OP_ACCOUNT:-}} cwd=${(qq)PWD} oppath=${(qq)${commands[op]:-op}} tmo=${(qq)tmo}" >| "$req/cmd" || { rm -rf "$req"; return 1 }
     # Killed while waiting (the resolver's watchdog does that): take the
     # request, and the result the holder may still write into it, along.
@@ -1487,22 +1553,13 @@ _opg_native() {
     env_file="$REPLY"
     auth="$(_opg_auth "$env_file")" || return 1
     (( $# )) || { print -u2 -- "usage: opgate op --profile <name> -- <op arguments>"; return 2 }
-    for arg in "$@"; do
-        case "$arg" in
-            --account|--account=*|--session|--session=*)
-                print -u2 -- "opgate: select the account with --profile"; return 2 ;;
-        esac
-    done
+    _opg_validate_native_args "$@" || return $?
     case "$1 ${2:-}" in
         'account list'|'account ls')
             # Device account inventory is metadata, not access to this profile's vaults.
             shift 2; _opg_accounts "$@"; return $? ;;
-        'item get'|'item list'|'vault get'|'vault list'|'document get'|'document list'|'read '*|'whoami '*)
-            ;;
-        'item create'|'item edit'|'item delete'|'item archive'|'item move'|'item copy'|'document create'|'document edit'|'document delete')
-            mutation=1 ;;
-        *) print -u2 -- "opgate: supported operations are item/document reads and writes, vault reads, read, whoami, and account list"; return 2 ;;
     esac
+    (( REPLY )) && mutation=1
     (( mutation )) && { _opg_invalidate || return 1 }
     _opg_auth_run "$auth" _opg_op "$@" || rc=$?
     # Invalidate on failure too: a timeout can follow a committed remote write.

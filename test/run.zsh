@@ -35,6 +35,7 @@ if [[ -n "${OP_FAKE_STDIN_LOG:-}" ]]; then
     fi
     print -r -- "$1 $kind:$first ppid=$PPID" >> "$OP_FAKE_STDIN_LOG"
 fi
+[[ -n "${OP_FAKE_ENV_LOG:-}" ]] && print -r -- "relay=${OP_FAKE_RELAY:-} secret=${OPGATE_TEST_SECRET:-}" >> "$OP_FAKE_ENV_LOG"
 [[ -n "${OP_FAKE_AUTH_LOG:-}" ]] && print -r -- "${OP_SESSION:+SET}:${OP_SESSION_test:+SET}" >> "$OP_FAKE_AUTH_LOG"
 case "$1" in
     run)
@@ -374,9 +375,9 @@ t "plain literals are op-free" "$before" "$(opcalls)"
 # 23. a value op would expand is not guessed at locally — it goes through op
 cat > "$work/profiles/expand.env" <<'EOF'
 KCX=keychain://svc-commented
-EXPANDED=$OPGATE_TEST_HOME/x
+EXPANDED=$OP_TEST_HOME/x
 EOF
-export OPGATE_TEST_HOME="/tmp/th"
+export OP_TEST_HOME="/tmp/th"
 before="$(opcalls)"
 t "expandable literal value" "/tmp/th/x" "$(opgate expand /bin/sh -c 'echo $EXPANDED')"
 t "expandable literal uses op" "$(( before + 1 ))" "$(opcalls)"
@@ -615,6 +616,7 @@ t 'empty legacy profile is rejected' 1 "$empty_rc"
 # process per session, so the desktop app sees one terminal session across
 # tool calls. The fake logs its parent pid: same holder, same parent.
 export OP_FAKE_STDIN_LOG="$work/stdin.log"
+export OP_FAKE_ENV_LOG="$work/holder-env.log" OP_FAKE_RELAY=present OPGATE_TEST_SECRET=must-not-reach
 export OPGATE_APPROVAL_KEEPALIVE=0
 print -r -- '# opgate:account test.1password.com' > "$work/profiles/approval.env"
 print -r -- 'APPROVAL=op://vault/item/field' >> "$work/profiles/approval.env"
@@ -628,6 +630,12 @@ holder_pid="$(<"$holder_dir/pid")"
 t 'holder is running' yes "$(kill -0 "$holder_pid" 2>/dev/null && print yes || print no)"
 t 'first no-tty call runs op in the holder' "item file: ppid=$holder_pid" "$first"
 t 'second shell reuses the same holder' "vault file: ppid=$holder_pid" "$second"
+t 'holder relays approved environment' 'relay=present secret=' "$(head -1 "$work/holder-env.log")"
+if find "$holder_dir" "$work/tmp" -type f -exec grep -l -- 'must-not-reach' {} + 2>/dev/null | read -r _; then
+    t 'holder does not write blocked environment' absent present
+else
+    t 'holder does not write blocked environment' absent absent
+fi
 local holder_rc=0
 zsh -c "source '$root/opgate.zsh'; OP_FAKE_ITEM_FAIL=1 opgate op --profile approval -- item get x" </dev/null >/dev/null 2>&1 || holder_rc=$?
 t 'holder relays exit status' 9 "$holder_rc"
@@ -672,6 +680,9 @@ sleep 0.3
 holder_dir="$(zsh -c "source '$root/opgate.zsh'; _opg_init; _opg_holder_dir" </dev/null)"
 t 'holder records a tree scope' tree "$(<"$holder_dir/scope")"
 [[ "$(<"$holder_dir/root")" == <->-<-> ]] && t 'holder records its root pid and start' yes yes || t 'holder records its root pid and start' yes "no ($(<"$holder_dir/root"))"
+root_identity="$(<"$holder_dir/root")"
+t 'session root remains live' yes "$(_opg_root_alive "$root_identity" && print yes || print no)"
+t 'dead session root fails check' no "$(_opg_root_alive '999999-0' && print yes || print no)"
 orphan_out="$work/orphan.out"; rm -f "$orphan_out"
 ( zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item list; print -r -- rc=\$?" </dev/null >"$orphan_out" 2>&1 & )
 local i=0; while ! grep -q '^rc=' "$orphan_out" 2>/dev/null && (( i++ < 80 )); do sleep 0.25; done
@@ -686,6 +697,15 @@ i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
 t 'unheld forged request is refused' 126 "$(<"$req/rc" 2>/dev/null)"
 t 'refused request never reaches op' "$before_ops" "$(wc -l < "$OP_FAKE_LOG" | tr -d ' ')"
 rm -rf "$req"
+# A request from the approved tree still cannot widen the holder's operation set.
+req="$holder_dir/req-forged2"; mkdir -m 700 "$req"; : > "$req/claim"; : > "$req/in"; /usr/bin/env -0 > "$req/env"
+exec {claimfd}>>"$req/claim"
+print -r -- "argv=( 'config' 'get' 'x' ) acct='test.1password.com' cwd='/' oppath='op' tmo='10'" > "$req/cmd"
+zsh -c 'zmodload zsh/system; sysopen -w -o nonblock -u fd "$1"; print -u $fd -r -- forged2' -- "$holder_dir/queue"
+i=0; while [[ ! -e "$req/rc" ]] && (( i++ < 80 )); do sleep 0.25; done
+t 'holder allowlist rejects forged operation' 2 "$(<"$req/rc" 2>/dev/null)"
+exec {claimfd}>&-
+rm -rf "$req"
 t 'ls names the tree root' yes "$([[ "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)" == *"serving the process tree under pid"* ]] && print yes || print no)"
 # scope=key serves any caller that knows the key, orphans included.
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
@@ -695,7 +715,7 @@ i=0; while ! grep -q '^rc=' "$orphan_out" 2>/dev/null && (( i++ < 80 )); do slee
 t 'OPGATE_APPROVAL_SCOPE=key serves an orphan' 'rc=0' "$(grep '^rc=' "$orphan_out")"
 t 'key scope is recorded' key "$(<"$holder_dir/scope")"
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
-unset OP_FAKE_STDIN_LOG OPGATE_APPROVAL_KEEPALIVE
+unset OP_FAKE_STDIN_LOG OP_FAKE_ENV_LOG OP_FAKE_RELAY OPGATE_TEST_SECRET OPGATE_APPROVAL_KEEPALIVE
 
 print
 print -r -- "passed $pass, failed $fail"
