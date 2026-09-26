@@ -1243,7 +1243,7 @@ _opg_holder_write_env() {
 _opg_holder_dir() {
     local key
     key="$(_opg_session_key_raw)" || return 1
-    print -r -- "$_opg_session_dir/${key}.v2.holder"
+    print -r -- "$_opg_session_dir/holders-v2/${key}.holder"
 }
 
 # Inert NUL-delimited fields: account, cwd, timeout, then argv. No shell code.
@@ -1457,7 +1457,7 @@ _opg_holder_stop() {
     dir="$(_opg_holder_dir)" || return 0
     # Revoke holders from both protocols when upgrading a live session.
     local current="$dir"
-    for dir in "$current" "${current%.v2.holder}.holder"; do
+    for dir in "$current" "$_opg_session_dir/${current:t}"; do
         [[ -d "$dir" ]] || continue
         if [[ -r "$dir/pid" ]]; then
             pid="$(<"$dir/pid")"

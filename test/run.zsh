@@ -12,7 +12,7 @@ export ZDOTDIR="$work/zdot"
 mkdir -p "$ZDOTDIR"
 # Approval holders spawned under $work outlive their spawner by design; stop
 # them with the suite or they would sit there until their 12h TTL.
-trap 'local f; for f in "$work"/tmp/opgate-session/*.holder/pid(N); do kill -TERM "$(<"$f")" 2>/dev/null; done; rm -rf "$work"' EXIT
+trap 'local f; for f in "$work"/tmp/opgate-session/*.holder/pid(N) "$work"/tmp/opgate-session/holders-v2/*.holder/pid(N); do kill -TERM "$(<"$f")" 2>/dev/null; done; rm -rf "$work"' EXIT
 
 # --- fake op ---------------------------------------------------------------
 # Logs every invocation; `op run` resolves op://x/y/z refs to "resolved:<VAR>"
@@ -655,7 +655,7 @@ OPGATE_APPROVAL=call zsh -c "source '$root/opgate.zsh'; opgate op --profile appr
     && t 'OPGATE_APPROVAL=call runs op directly' no yes || t 'OPGATE_APPROVAL=call runs op directly' no no
 t 'ls reports the holder' "approval: holder pid $holder_pid for session ${${holder_dir:t}%.holder}" "${$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)%%, serving*}"
 # An upgrade must also revoke a holder from the executable-request protocol.
-local legacy_dir="${holder_dir%.v2.holder}.holder" legacy_pid
+local legacy_dir="${holder_dir:h:h}/${holder_dir:t}" legacy_pid
 mkdir -m 700 "$legacy_dir"
 sleep 600 &
 legacy_pid=$!
@@ -777,6 +777,24 @@ chmod +x "$work/alternate-bin/op"
 PATH="$work/alternate-bin:$PATH" _opg_holder_call "$holder_dir" item list >/dev/null
 t 'holder pins op at startup' absent "$([[ -e "$work/replaced-op-ran" ]] && print present || print absent)"
 t 'ls names the tree root' yes "$([[ "$(zsh -c "source '$root/opgate.zsh'; opgate ls" </dev/null | tail -1)" == *"serving the process tree under pid"* ]] && print yes || print no)"
+# Dotted explicit keys cannot alias another session across protocol versions.
+local other_dir="$work/tmp/opgate-session/holders-v2/collision.holder" other_pid
+local dotted_legacy="$work/tmp/opgate-session/collision.v2.holder" dotted_pid
+mkdir -m 700 "$other_dir" "$dotted_legacy"
+sleep 600 &
+other_pid=$!
+print -r -- "$other_pid" > "$other_dir/pid"
+sleep 600 &
+dotted_pid=$!
+print -r -- "$dotted_pid" > "$dotted_legacy/pid"
+OPGATE_SESSION_KEY=collision.v2 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
+sleep 0.2
+t 'dotted key flush preserves the other session' yes "$(kill -0 "$other_pid" 2>/dev/null && print yes || print no)"
+t 'dotted key flush preserves the other directory' present "$([[ -d "$other_dir" ]] && print present || print absent)"
+t 'dotted key flush stops its own legacy holder' no "$(kill -0 "$dotted_pid" 2>/dev/null && print yes || print no)"
+kill -TERM "$other_pid" 2>/dev/null || true
+wait "$other_pid" "$dotted_pid" 2>/dev/null || true
+rm -rf "$other_dir"
 # scope=key serves any caller that knows the key, orphans included.
 zsh -c "source '$root/opgate.zsh'; opgate flush --session" </dev/null
 rm -f "$orphan_out"
