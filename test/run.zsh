@@ -640,8 +640,12 @@ local holder_rc=0
 zsh -c "source '$root/opgate.zsh'; OP_FAKE_ITEM_FAIL=1 opgate op --profile approval -- item get x" </dev/null >/dev/null 2>&1 || holder_rc=$?
 t 'holder relays exit status' 9 "$holder_rc"
 t 'holder relays stdout' item-ok "$(zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item get x" </dev/null 2>/dev/null)"
+# op reads a template from stdin only when stdin is a pipe; from a regular file it
+# ignores it ("provide the item category"). So the holder must hand it over as a pipe.
 print template | zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item create" >/dev/null
-t 'piped template reaches op through the holder' "item file:template ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
+t 'piped template reaches op through the holder' "item pipe:template ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
+print template | zsh -c "source '$root/opgate.zsh'; opgate op --profile approval -- item create --vault v -" >/dev/null
+t 'piped template with "-" reaches op as a pipe' "item pipe:template ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
 out="$(print childdata | zsh -c "source '$root/opgate.zsh'; opgate session --profile approval -- /bin/sh -c 'IFS= read -r x; printf %s \"\$x\"'")"
 t 'session check runs in the holder' "vault file: ppid=$holder_pid" "$(tail -1 "$OP_FAKE_STDIN_LOG")"
 t 'session child keeps its own stdin' childdata "$out"

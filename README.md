@@ -152,6 +152,9 @@ agent session reuses the approval.
 - Version 0.6.2 uses a separate holder protocol directory. Existing holders
   remain with their original session until it ends. After upgrading, run
   `opgate flush --session` to stop both old and new holders for that session.
+- Version 0.6.3 gives a relayed stdin template to `op` through a pipe:
+  `op item create -` ignores a template on a regular-file stdin. A running
+  holder keeps its old code; run `opgate flush --session` after upgrading.
   The next account call uses the corrected protocol and may require approval.
 
 Who may use it: only the session that approved it. At spawn the holder
