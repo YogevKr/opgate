@@ -83,7 +83,7 @@
 # All state lives here rather than at file scope: some agent harnesses
 # (Claude Code) snapshot the shell by dumping functions and exported env, so
 # plain globals set at source time are gone by the time a tool call runs.
-typeset -g OPGATE_VERSION=0.6.2
+typeset -g OPGATE_VERSION=0.6.3
 
 _opg_init() {
     # ${:-} guards throughout: this must survive a sourcing shell that has
@@ -1355,7 +1355,13 @@ _opg_holder_main() {
           local _clear_name
           for _clear_name in ${(k)parameters[(R)*export*]}; do unset "$_clear_name" 2>/dev/null; done
           (( ${#filtered_envs} )) && export "${filtered_envs[@]}" 2>/dev/null
-          exec "$oppath" "${request_argv[@]}" ) <"$dir/req-$id/in" >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
+          # op reads a template from stdin only when stdin is a pipe; a regular
+          # file is ignored ("provide the item category"). Relayed input goes
+          # in through a pipe; empty input stays an empty file, as before.
+          if [[ -s "$dir/req-$id/in" ]]; then
+              exec "$oppath" "${request_argv[@]}" < <(command cat -- "$dir/req-$id/in")
+          fi
+          exec "$oppath" "${request_argv[@]}" <"$dir/req-$id/in" ) >|"$dir/req-$id/out" 2>|"$dir/req-$id/err" &
         # Bounded, like _opg_capture: a request that never answers must not
         # take every later request on this holder down with it.
         cpid=$! waited=0
